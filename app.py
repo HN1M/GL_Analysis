@@ -894,36 +894,7 @@ if uploaded_file is not None:
                                     with st.expander("이 차트의 통계 설정 보기", expanded=False):
                                         st.write(stx)
 
-                        # (선택) 데이터 검증: 월별 추세 분석(막대그래프)으로 직접 대조
-                        with st.expander("데이터 검증: 월별 추세 분석(막대그래프)으로 직접 대조", expanded=False):
-                            try:
-                                mdf = st.session_state.master_df
-                                code_series = mdf.loc[mdf['계정명'] == sel_acc, '계정코드'].astype(str)
-                                if code_series.empty:
-                                    st.info("선택한 계정 코드가 없습니다.")
-                                else:
-                                    acc_code = code_series.iloc[0]
-                                    lf_use = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
-                                    mod_tr = run_trend_module(lf_use, accounts=[acc_code])
-                                    if mod_tr and mod_tr.figures:
-                                        shown = False
-                                        for title, fig in mod_tr.figures.items():
-                                            is_balance = ("잔액" in title) or ("Balance" in title)
-                                            if (measure == "balance" and is_balance) or (measure == "flow" and not is_balance):
-                                                st.plotly_chart(
-                                                    add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT))),
-                                                    use_container_width=True,
-                                                    key=f"trendbar_{acc_code}_{measure}"
-                                                )
-                                                shown = True
-                                                break
-                                        if not shown:
-                                            _t, _f = list(mod_tr.figures.items())[0]
-                                            st.plotly_chart(_f, use_container_width=True, key=f"trendbar_{acc_code}_{measure}_fallback")
-                                    else:
-                                        st.info("트렌드 막대그래프를 생성할 수 없습니다.")
-                            except Exception as _e:
-                                st.info(f"트렌드 검증을 표시하지 못했습니다: {_e}")
+                        # (삭제됨) 막대 대조 UI — 오류 원인 경로 차단
 
                     else:
                         st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")

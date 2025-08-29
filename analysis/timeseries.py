@@ -235,8 +235,10 @@ def _one_track_lastrow(
     sigma = _std_last(resid, w=6)
     z = float(error_last / sigma) if sigma > 0 else 0.0
     risk = _risk_score(abs(z), amount=float(y.iloc[-1]), pm=float(pm_value))
+    # 날짜 앵커: flow=월초(how='start'), balance=월말(how='end')
+    _how = 'start' if measure == 'flow' else 'end'
     return {
-        "date": df["_p"].iloc[-1].to_timestamp(),
+        "date": df["_p"].iloc[-1].to_timestamp(how=_how),
         "measure": measure,
         "actual": float(y.iloc[-1]),
         "predicted": float(yhat[-1]),
@@ -397,18 +399,19 @@ def insample_predict_df(
 ) -> pd.DataFrame:
     """
     월별 데이터(monthly: ['date', value_col])에 대해 MoR이 고른 모델의 in-sample 예측선을 반환.
-    반환 컬럼: date, actual, predicted, model, train_months, data_span, sigma_win
+    반환 컬럼: date, actual, predicted, model, train_months, data_span, sigma_win, measure, value_col
     """
     df = _prepare_monthly(monthly, "date")
     if df.empty or value_col not in df.columns:
-        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win"])
+        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win","measure","value_col"])
     y = pd.Series(df[value_col].astype(float).values, index=pd.PeriodIndex(df["_p"], freq="M"))
     if len(y) < 2:
-        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win"])
+        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win","measure","value_col"])
     model, yhat = _choose_model(y, measure=measure)
     span = f"{y.index[0].strftime('%Y-%m')} ~ {y.index[-1].strftime('%Y-%m')}"
+    _how = 'start' if measure == 'flow' else 'end'
     out = pd.DataFrame({
-        "date": y.index.to_timestamp(),
+        "date": y.index.to_timestamp(how=_how),
         "actual": y.values,
         "predicted": yhat,
         "model": model,
@@ -416,8 +419,59 @@ def insample_predict_df(
     out["train_months"] = len(y)
     out["data_span"] = span
     out["sigma_win"] = 6  # z 계산에 쓰는 최근 분산 윈도우
+    out["measure"] = str(measure)
+    out["value_col"] = str(value_col)
     return out
 
+
+# ------------------- Validation Builder (tidy helper) -------------------
+def build_trend_validation_data(
+    monthly: pd.DataFrame,
+    *,
+    flow_col: str = "flow",
+    balance_col: Optional[str] = None,
+    is_bs: bool = False,
+    pm_value: float = _PM_DEFAULT,
+) -> pd.DataFrame:
+    """
+    트렌드 검증용 tidy 데이터 생성:
+      columns → ['date','actual','predicted','measure','model']
+    - PL: flow만
+    - BS: flow + balance(있으면 사용, 없으면 flow 누적합으로 생성)
+    """
+    rows: List[pd.DataFrame] = []
+
+    # flow
+    if flow_col in monthly.columns:
+        df_flow = insample_predict_df(
+            monthly[["date", flow_col]].rename(columns={flow_col: "val"}),
+            value_col="val",
+            measure="flow",
+            pm_value=pm_value,
+        )
+        if not df_flow.empty:
+            rows.append(df_flow[["date","actual","predicted","measure","model"]])
+
+    # balance (BS만) — balance는 '월말' 시점 기준
+    if is_bs:
+        if balance_col and (balance_col in monthly.columns):
+            base = monthly[["date", balance_col]].rename(columns={balance_col: "val"})
+        else:
+            # 누적합으로 balance 가상 생성(월말 시점으로 표시됨)
+            if flow_col not in monthly.columns:
+                base = None
+            else:
+                tmp = monthly[["date", flow_col]].copy()
+                tmp["val"] = tmp[flow_col].astype(float).cumsum()
+                base = tmp[["date","val"]]
+        if base is not None:
+            df_bal = insample_predict_df(base, value_col="val", measure="balance", pm_value=pm_value)
+            if not df_bal.empty:
+                rows.append(df_bal[["date","actual","predicted","measure","model"]])
+
+    if not rows:
+        return pd.DataFrame(columns=["date","actual","predicted","measure","model"])
+    return pd.concat(rows, ignore_index=True)
 
 # ------------------- Validation: reconcile with trend -------------------
 def reconcile_with_trend(
@@ -447,3 +501,52 @@ def reconcile_with_trend(
         })
     df_chk = pd.DataFrame(rows).set_index("month")
     return df_chk[(df_chk["Δflow"].abs() > tol) | (df_chk["Δbal"].abs() > tol)]
+
+
+# ------------------- Optional: lightweight validation summary -----------
+def validation_summary(
+    monthly: pd.DataFrame,
+    *,
+    date_col: str = "date",
+    value_col: str = "amount",
+    pm_value: float = _PM_DEFAULT,
+    last_k: int = 6,
+) -> Dict[str, Any]:
+    """막대 대조 대신 쓰는 경량 숫자 진단 카드."""
+    df = monthly[[date_col, value_col]].rename(columns={date_col: "date", value_col: "val"}).copy()
+    df = _prepare_monthly(df, "date")
+    if df.empty or "val" not in df.columns:
+        return {"n_points": 0}
+    y = pd.Series(df["val"].astype(float).values, index=pd.PeriodIndex(df["_p"], freq="M"))
+    if len(y) < 2:
+        return {"n_points": int(len(y))}
+    scores = [("EMA", _rolling_origin_cv(y, _fit_ema, _pred_ema)),
+              ("MA",  _rolling_origin_cv(y, _fit_ma,  _pred_ma))]
+    reg = _model_registry()
+    if reg["arima"]:
+        try: scores.append(("ARIMA", _rolling_origin_cv(y, _fit_arima, _pred_arima)))
+        except Exception: pass
+    if reg["prophet"] and len(y) >= 12 and _has_seasonality(y):
+        try: scores.append(("Prophet", _rolling_origin_cv(y, _fit_prophet, _pred_prophet)))
+        except Exception: pass
+    best_cv_name, best_cv_smape = min(scores, key=lambda x: x[1])
+    model_name, yhat = _choose_model(y, measure="flow")
+    resid = y.values - yhat
+    k = min(last_k, len(y))
+    smape_k = _smape(y.values[-k:], yhat[-k:])
+    last_err = float(resid[-1])
+    sigma = _std_last(resid, w=6)
+    z = float(last_err / sigma) if sigma > 0 else 0.0
+    pm_ratio = (abs(float(y[-1])) / float(pm_value)) if pm_value else 0.0
+    return {
+        "n_points": int(len(y)),
+        "mor": model_name,
+        "cv_smape": float(best_cv_smape),
+        "smape_last_k": float(smape_k),
+        "last_month": str(y.index[-1].to_timestamp(how='start').date()),
+        "last_actual": float(y[-1]),
+        "last_pred": float(yhat[-1]),
+        "last_error": last_err,
+        "last_z": z,
+        "pm_ratio": pm_ratio,
+    }

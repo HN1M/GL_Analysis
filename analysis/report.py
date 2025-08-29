@@ -226,7 +226,8 @@ def build_timeseries_summary_block(current_df: pd.DataFrame, topn: int = 5) -> s
 
     m = (df.groupby(['계정명','연월'], as_index=False)[val_col].sum())
     m['account'] = m['계정명']
-    m['date'] = m['연월'].dt.to_timestamp('M')
+    # Flow는 월 ‘집계’ 개념이므로 내부 앵커는 월초(start)로 통일
+    m['date'] = m['연월'].dt.to_timestamp(how='start')
     m['amount'] = m[val_col]
 
     rows = run_timeseries_module(m[['account','date','amount']])
@@ -245,8 +246,10 @@ def build_timeseries_summary_block(current_df: pd.DataFrame, topn: int = 5) -> s
         "※ 기본은 '월별 발생액(Δ잔액/flow)'. BS 계정은 **balance** 기준도 내부 평가하며, 아래 표기는 MoR과 z·risk를 함께 보여줍니다."
     ]
     for _, r in rows.iterrows():
+        _m = str(r.get('measure','flow'))
+        _when = "월합계" if _m == "flow" else "월말"
         lines.append(
-            f"- [{_fmt_dt(r['date'])}] {r['account']} ({r.get('measure','flow')}, MoR={r.get('model','-')})"
+            f"- [{_fmt_dt(r['date'])}·{_when}] {r['account']} ({_m}, MoR={r.get('model','-')})"
             f" | 실제 {r['actual']:,.0f}원 vs 예측 {r['predicted']:,.0f}원"
             f" → {'상회' if float(r['error'])>0 else '하회'} | z={float(r['z']):+.2f} | risk={float(r['risk']):.2f}"
         )

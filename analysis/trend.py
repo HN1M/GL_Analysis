@@ -39,7 +39,7 @@ def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame
             monthly_series.update(monthly_flow)
             monthly_balance = bop + monthly_series.cumsum()
             plot_df_list.append(pd.DataFrame({'월': months, '금액': monthly_balance.values * sign, '구분': year_label}))
-        title_suffix = "월별 잔액 추이 (BS)"
+        title_suffix = "월별 잔액 추이 (BS · 월말)"
     else:
         # PL: 금액 컬럼 유연 인식
         cand = ['거래금액', '발생액', '거래금액_절대값', 'amount', '금액']
@@ -52,7 +52,7 @@ def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame
             monthly_series = pd.Series(index=months, data=0.0)
             monthly_series.update(year_data.set_index('월')[amt_col])
             plot_df_list.append(pd.DataFrame({'월': months, '금액': monthly_series.values * sign, '구분': year_label}))
-        title_suffix = "월별 발생액 추이 (PL)"
+        title_suffix = "월별 발생액 추이 (PL · 월합계)"
 
     if not plot_df_list:
         return None
@@ -68,7 +68,9 @@ def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame
     fig.update_xaxes(dtick=1)
     # 🔢 축/툴팁 포맷: 천단위 쉼표, SI 단위 제거
     fig.update_yaxes(separatethousands=True, tickformat=',.0f', showexponent='none', exponentformat='none')
-    fig.update_traces(hovertemplate='월=%{x}<br>금액=%{y:,.0f} 원<br>구분=%{fullData.name}<extra></extra>')
+    _note = "시점=월말" if bspl == 'BS' else "집계=월합계"
+    fig.update_traces(hovertemplate=f'월=%{{x}}<br>금액=%{{y:,.0f}} 원<br>{_note}<br>구분=%{{fullData.name}}<extra></extra>')
+    fig.update_layout(xaxis_title="월", yaxis_title="금액(원)")
     return fig
 
 
