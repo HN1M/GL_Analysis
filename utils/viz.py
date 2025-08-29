@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 from typing import Optional
+import pandas as pd
 import math
 
 
@@ -166,4 +167,51 @@ def add_pm_badge(fig, pm_value: Optional[float], *, text: str | None = None):
     fig.update_layout(annotations=annotations)
     return fig
 
+
+
+def add_time_dividers(fig, xdates, show_quarter: bool = True, show_year_label: bool = True):
+    """
+    xdates: datetime Series/List (차트의 x 값)
+    - 연도 경계(1/1): 굵은 실선
+    - 분기 경계(4/1, 7/1, 10/1): 얇은 점선
+    """
+    if xdates is None:
+        return fig
+    try:
+        ts = pd.to_datetime(pd.Series(xdates)).dropna().sort_values()
+    except Exception:
+        return fig
+    if ts.empty:
+        return fig
+
+    # 연도 경계 (첫 해는 제외, 다음 해 1/1 지점)
+    years = ts.dt.year.unique()
+    for y in years[1:]:
+        x = pd.Timestamp(year=y, month=1, day=1)
+        if x < ts.iloc[0] or x > ts.iloc[-1]:
+            continue
+        try:
+            fig.add_vline(
+                x=x, line_width=2, line_dash="solid",
+                line_color="rgba(0,0,0,0.35)",
+                annotation_text=(str(y) if show_year_label else None),
+                annotation_position="top", annotation_font_color="rgba(0,0,0,0.55)"
+            )
+        except Exception:
+            continue
+
+    # 분기 경계: 4/1, 7/1, 10/1
+    if show_quarter:
+        start = pd.Timestamp(ts.iloc[0].year, ts.iloc[0].month, 1)
+        end   = pd.Timestamp(ts.iloc[-1].year, ts.iloc[-1].month, 1)
+        for x in pd.date_range(start, end, freq="MS"):
+            if x.month in (4, 7, 10):
+                try:
+                    fig.add_vline(
+                        x=x, line_width=1, line_dash="dot",
+                        line_color="rgba(0,0,0,0.18)"
+                    )
+                except Exception:
+                    continue
+    return fig
 

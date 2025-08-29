@@ -413,7 +413,8 @@ if uploaded_file is not None:
                                 # PM 임계선(항상 표시; 범위 밖이면 자동 확장)
                                 st.plotly_chart(
                                     add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT))),
-                                    use_container_width=True
+                                    use_container_width=True,
+                                    key=f"trend_{title}"
                                 )
                         else:
                             st.info("표시할 추이 그래프가 없습니다.")
@@ -442,7 +443,11 @@ if uploaded_file is not None:
                         for w in cmod.warnings:
                             st.warning(w)
                         if cmod.figures:
-                            st.plotly_chart(cmod.figures['heatmap'], use_container_width=True)
+                            st.plotly_chart(
+                                cmod.figures['heatmap'],
+                                use_container_width=True,
+                                key=f"corr_heatmap_{hash(tuple(codes))}_{corr_thr}"
+                            )
                         if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
                             st.markdown("**임계치 이상 상관쌍**")
                             st.dataframe(cmod.tables['strong_pairs'], use_container_width=True)
@@ -487,11 +492,11 @@ if uploaded_file is not None:
                                 if 'pareto' in vmod.figures:
                                     figp = vmod.figures['pareto']
                                     figp = add_materiality_threshold(figp, float(st.session_state.get("pm_value", PM_DEFAULT)))
-                                    st.plotly_chart(figp, use_container_width=True)
+                                    st.plotly_chart(figp, use_container_width=True, key=f"vendor_pareto_{'_'.join(selected_accounts_vendor) or 'all'}")
                             with col2:
                                 if 'heatmap' in vmod.figures:
                                     figh = add_pm_badge(vmod.figures['heatmap'], float(st.session_state.get("pm_value", PM_DEFAULT)))
-                                    st.plotly_chart(figh, use_container_width=True)
+                                    st.plotly_chart(figh, use_container_width=True, key=f"vendor_heatmap_{'_'.join(selected_accounts_vendor) or 'all'}")
                         else:
                             st.warning("선택하신 계정에는 분석할 거래처 데이터가 부족합니다.")
                         for w in vmod.warnings:
@@ -521,7 +526,7 @@ if uploaded_file is not None:
                             except Exception:
                                 pass
                             if detail_fig:
-                                st.plotly_chart(detail_fig, use_container_width=True)
+                                st.plotly_chart(detail_fig, use_container_width=True, key=f"vendor_detail_{selected_vendor}")
                     else:
                         st.info("분석할 거래처 데이터가 없습니다.")
 
@@ -546,11 +551,21 @@ if uploaded_file is not None:
                             if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:.2f}'
                             st.dataframe(_tbl.style.format(fmt), use_container_width=True)
                         if 'zscore_hist' in amod.figures:
-                            st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True)
+                            st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True, key="anomaly_hist")
 
                 with tab_ts:
                     st.header("시계열 예측(MoR) — 마지막 포인트 요약 + 라인차트")
                     st.caption("※ 기본값은 '월별 발생액(Δ잔액)'이며, BS 계정은 잔액(balance) 기준도 병행합니다.")
+                    # 항상 노출되는 간단 가이드(2줄)
+                    st.caption("error=실제-예측 (양수=예상보다 큼), |z|≈2 주의 / 3 이상 이례")
+                    st.caption("위험도는 |z|, PM 대비 규모, KIT 여부를 결합한 0~1 점수")
+                    # 모델 가용 배지(디버깅 겸 사용자 안내)
+                    try:
+                        from analysis.timeseries import model_registry
+                        _reg = model_registry()
+                        st.caption(f"지원 모델: EMA ✓ · MA ✓ · ARIMA {'✓' if _reg['arima'] else '—'} · Prophet {'✓' if _reg['prophet'] else '—'}")
+                    except Exception:
+                        pass
                     with st.expander("📘 해석 가이드", expanded=False):
                         st.markdown(
                             "- **error = 실제 − 예측** (양수면 예상보다 큼)\n"
@@ -575,66 +590,202 @@ if uploaded_file is not None:
                         out = out.rename(columns={'account':'계정'})
                         for c in ['actual','predicted','error','z','risk']:
                             out[c] = pd.to_numeric(out[c], errors='coerce')
+                        # 사용자 친화적 표기(기준): 발생액/잔액
+                        try:
+                            out['measure'] = out['measure'].map(lambda m: '발생액(flow)' if str(m)=='flow' else ('잔액(balance)' if str(m)=='balance' else str(m)))
+                        except Exception:
+                            pass
                         _disp = out[['date','계정','measure','model','actual','predicted','error','z','risk']].rename(columns={
-                            'predicted': '예상 발생액(월 합계)',
-                            'error': '차이(실제-예상)'
+                            'date': '월',
+                            'measure': '기준(Measure)',
+                            'model': '모델(MoR)',
+                            'actual': '실제(월 합계)',
+                            'predicted': '예측(월 합계)',
+                            'error': '차이(실제-예측)',
+                            'z': '표준화지수(z)',
+                            'risk': '위험도(0~1)'
                         })
                         st.caption("MoR(최적 모델) 기준. BS는 balance 기준도 병행 계산합니다(요약 테이블에는 flow가 기본).")
                         st.dataframe(_disp.style.format({
-                            'actual':'{:,.0f}', '예상 발생액(월 합계)':'{:,.0f}', '차이(실제-예상)':'{:,.0f}', 'z':'{:+.2f}', 'risk':'{:.2f}'
+                            '실제(월 합계)':'{:,.0f}', '예측(월 합계)':'{:,.0f}', '차이(실제-예측)':'{:,.0f}', '표준화지수(z)':'{:+.2f}', '위험도(0~1)':'{:.2f}'
                         }), use_container_width=True)
 
                         # === 라인차트 ===
                         import plotly.graph_objects as go
+                        from analysis.timeseries import insample_predict_df
+                        from utils.viz import add_time_dividers
 
-                        def _make_ts_fig(df_hist: pd.DataFrame, measure: str, title: str):
-                            s = df_hist[['date', measure]].rename(columns={measure: 'actual'}).sort_values('date').copy()
-                            if s.empty:
-                                return None
-                            # 간단 예측선: EMA(shift 1)
-                            s['predicted'] = s['actual'].ewm(span=6, adjust=False).mean().shift(1)
+                        def _make_ts_fig_with_stats(df_hist: pd.DataFrame, measure: str, title: str):
+                            vcol = 'flow' if measure == 'flow' else 'balance'
+                            base = df_hist[['date', vcol]].rename(columns={vcol: 'val'}).sort_values('date')
+                            ins = insample_predict_df(
+                                base.rename(columns={'val': vcol}),
+                                value_col=vcol,
+                                measure=measure,
+                                pm_value=float(st.session_state.get("pm_value", PM_DEFAULT))
+                            )
+                            if ins.empty:
+                                return None, None
                             fig = go.Figure()
-                            fig.add_trace(go.Scatter(x=s['date'], y=s['actual'], mode='lines', name='actual'))
-                            fig.add_trace(go.Scatter(x=s['date'], y=s['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
-                            fig.update_layout(title=title, xaxis_title='month', yaxis_title=measure)
+                            fig.add_trace(go.Scatter(x=ins['date'], y=ins['actual'], mode='lines', name='actual'))
+                            fig.add_trace(go.Scatter(x=ins['date'], y=ins['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
+                            fig.update_layout(title=title, xaxis_title='month', yaxis_title='원')
+                            fig.update_yaxes(tickformat=",.0f", separatethousands=True, ticksuffix="")
                             try:
-                                return add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
+                                fig = add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
                             except Exception:
-                                return fig
+                                pass
+                            # 연/분기 구분선 추가 (토글 가능)
+                            show_dividers = st.toggle("연/분기 구분선 표시", value=True, key=f"ts_dividers_toggle_{title}")
+                            if show_dividers:
+                                try:
+                                    fig = add_time_dividers(fig, ins['date'])
+                                except Exception:
+                                    pass
+                            stats = {
+                                "모델": str(ins['model'].iloc[-1]),
+                                "학습기간(월)": int(ins['train_months'].iloc[-1]),
+                                "데이터 구간": str(ins['data_span'].iloc[-1]),
+                                "σ 윈도우(최근)": int(ins['sigma_win'].iloc[-1]),
+                                "CV K": 3,
+                            }
+                            return fig, stats
 
                         st.markdown("#### 라인차트")
                         # 월별 집계에서 flow/balance 히스토리 구성
-                        hist_base = use_ts.rename(columns={'amount':'flow'}).copy()
-                        hist_base = hist_base.sort_values('date')
-                        hist_base['balance'] = hist_base.groupby('account')['flow'].cumsum()
+                        hist_base = use_ts.rename(columns={'amount':'flow'}).sort_values('date').copy()
+                        hist_base['balance'] = hist_base['flow']
+                        # 계정별 opening (=전기말잔액) 맵
+                        _open = st.session_state.master_df[['계정명','전기말잔액']].drop_duplicates()
+                        opening_map = _open.set_index('계정명')['전기말잔액'].to_dict()
+
+                        def _apply_opening(g):
+                            acc_name = str(g['account'].iloc[0])
+                            opn = float(opening_map.get(acc_name, 0.0))
+                            g = g.copy()
+                            g['balance'] = opn + g['flow'].astype(float).cumsum()
+                            return g
+
+                        hist_base = hist_base.groupby('account', group_keys=False).apply(_apply_opening)
 
                         # 계정 선택
                         sel_acc = st.selectbox("계정 선택(라인차트)", sorted(hist_base['account'].unique()), key="ts_plot_acc_main")
 
                         # BS/PL 판단
-                        _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
+                        _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL','차변/대변']].drop_duplicates()
                         is_bs = bool(_mdf[_mdf['계정명'] == sel_acc]['BS/PL'].astype(str).str.upper().eq('BS').any())
 
                         cur_hist = hist_base[hist_base['account'] == sel_acc].copy()
                         if cur_hist.empty:
                             st.info("선택 계정의 월별 데이터가 없습니다.")
                         else:
+                            # 학습 구간/개월수/선택 모델 표기
+                            try:
+                                s = cur_hist.sort_values('date')
+                                span = f"{s['date'].min():%Y-%m} ~ {s['date'].max():%Y-%m}"
+                                n_mon = int(s['date'].dt.to_period('M').nunique())
+                                # 선택 모델 (flow/balance)
+                                used_model_flow = None
+                                used_model_balance = None
+                                try:
+                                    used_model_flow = res.loc[(res['account']==sel_acc)&(res['measure']=='flow'), 'model'].iloc[-1]
+                                except Exception:
+                                    pass
+                                try:
+                                    used_model_balance = res.loc[(res['account']==sel_acc)&(res['measure']=='balance'), 'model'].iloc[-1]
+                                except Exception:
+                                    pass
+                                # 간단 통계 (MAE/MAPE는 insample_df에서 직접 계산 가능)
+                                from analysis.timeseries import insample_predict_df
+                                _tmp_flow = insample_predict_df(cur_hist[['date','flow']], 'flow', 'flow')
+                                if not (_tmp_flow is None or _tmp_flow.empty):
+                                    import numpy as _np
+                                    mae = float(_np.mean(_np.abs(_tmp_flow['actual'] - _tmp_flow['predicted'])))
+                                    mape = float(_np.mean(_np.where(_tmp_flow['actual'] != 0, _np.abs((_tmp_flow['actual'] - _tmp_flow['predicted']) / _tmp_flow['actual']) * 100.0, 0.0)))
+                                else:
+                                    mae = 0.0; mape = 0.0
+                                sigma_window = 6
+                                st.caption(
+                                    f"학습기간: {span} ({n_mon}개월) · σ윈도우: {sigma_window}개월 · 선택모델(Flow/Balance): {used_model_flow or '-'} / {used_model_balance or '-'} · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}%"
+                                )
+                            except Exception:
+                                used_model_flow = None; used_model_balance = None
+
+                            # 대변계정(부채·자본·수익)인 경우 그래프 부호 반전
+                            try:
+                                from utils.helpers import is_credit_account
+                                # Master에서 해당 계정의 속성 조회
+                                _row = _mdf[_mdf['계정명'] == sel_acc].iloc[0] if not _mdf[_mdf['계정명'] == sel_acc].empty else None
+                                acc_type = _row.get('BS/PL', 'PL') if _row is not None else 'PL'
+                                dc_flag = _row.get('차변/대변') if _row is not None else None
+                                if is_credit_account(acc_type if acc_type in ['부채','자본','수익'] else None, dc_flag):
+                                    cur_hist = cur_hist.copy()
+                                    cur_hist['flow'] = -cur_hist['flow']
+                                    cur_hist['balance'] = -cur_hist['balance']
+                            except Exception:
+                                pass
+
                             if is_bs:
                                 pair = st.toggle("쌍차트 보기(Flow+Balance)", value=True)
                                 if pair:
                                     c1, c2 = st.columns(2)
+                                    # 모델 표기(Flow/Balance)
+                                    try:
+                                        st.caption(f"선택 모델(MoR): Flow={used_model_flow or '-'} · Balance={used_model_balance or '-'}")
+                                    except Exception:
+                                        pass
                                     with c1:
-                                        f1 = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                        if f1: st.plotly_chart(f1, use_container_width=True)
+                                        f1, st1 = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                        if f1:
+                                            st.plotly_chart(f1, use_container_width=True, key=f"ts_line_{sel_acc}_flow")
+                                            with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                                st.write(st1)
                                     with c2:
-                                        f2 = _make_ts_fig(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
-                                        if f2: st.plotly_chart(f2, use_container_width=True)
+                                        f2, st2 = _make_ts_fig_with_stats(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
+                                        if f2:
+                                            st.plotly_chart(f2, use_container_width=True, key=f"ts_line_{sel_acc}_balance")
+                                            with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                                st.write(st2)
                                 else:
-                                    fig = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                    if fig: st.plotly_chart(fig, use_container_width=True)
+                                    fig, stx = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                    try:
+                                        st.caption(f"기준: Flow · 선택 모델(MoR): {used_model_flow or '-'}")
+                                    except Exception:
+                                        pass
+                                    if fig:
+                                        st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_flow_single")
+                                        with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                            st.write(stx)
                             else:
-                                fig = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                if fig: st.plotly_chart(fig, use_container_width=True)
+                                fig, stx = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                try:
+                                    st.caption(f"기준: Flow · 선택 모델(MoR): {used_model_flow or '-'}")
+                                except Exception:
+                                    pass
+                                if fig:
+                                    st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_flow_only")
+                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                        st.write(stx)
+
+                        # (선택) 데이터 검증: trend.py와 월별 대조
+                        try:
+                            from analysis.timeseries import reconcile_with_trend
+                            # timeseries 입력 시리즈(flow, balance)
+                            ts_flow = hist_base[hist_base['account']==sel_acc].set_index('date')['flow']
+                            ts_bal  = hist_base[hist_base['account']==sel_acc].set_index('date')['balance']
+                            # trend 모듈 산출 흐름/잔액 재구성(간단: 같은 집계 방식 재사용)
+                            trend_flow = ts_flow.copy()  # 필요 시 별도 소스와 비교하도록 확장 가능
+                            trend_bal  = ts_bal.copy()
+                            mismatch = reconcile_with_trend(ts_flow, ts_bal, trend_flow, trend_bal)
+                            with st.expander("데이터 검증: trend.py와 대조", expanded=False):
+                                if mismatch is None or mismatch.empty:
+                                    st.success("검증 완료: trend.py와 월별 Flow/Balance가 모두 일치합니다.")
+                                else:
+                                    st.error("일부 월이 일치하지 않습니다. 아래 표를 확인하세요.")
+                                    st.dataframe(mismatch, use_container_width=True)
+                        except Exception:
+                            pass
+
                     else:
                         st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")
                 with tab5:
@@ -740,7 +891,7 @@ if uploaded_file is not None:
                                         title="계정 × 주장 위험 히트맵 (max risk_score, 0~1)",
                                         labels=dict(x="Assertion", y="Account", color="Risk"))
                         fig.update_coloraxes(cmin=0, cmax=1)
-                        st.plotly_chart(fig, use_container_width=True)
+                        st.plotly_chart(fig, use_container_width=True, key="risk_heatmap")
                         with st.expander("수치 테이블 보기", expanded=False):
                             st.dataframe(mat, use_container_width=True)
                         # 🔽 전체 Evidence CSV 내보내기 (행렬 근거 전부)

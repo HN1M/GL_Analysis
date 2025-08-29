@@ -33,3 +33,22 @@ def add_period_tag(df: pd.DataFrame) -> pd.DataFrame:
     out["period_tag"] = out["연도"].apply(lambda y: "CY" if y == y_max else ("PY" if y == y_max - 1 else "Other"))
     return out
 
+
+# --- NEW: 차트 전용 대변계정 판정(그래프에서만 부호 반전) ---
+def is_credit_account(account_type: str | None, dc: str | None = None) -> bool:
+    """
+    계정 성격이 대변(Credit)인지 판정합니다.
+    - dc가 주어지면 우선 사용(예: '차변'/'대변' 또는 'D'/'C')
+    - 아니면 account_type으로 간접 판정: 부채/자본/수익 → Credit
+    """
+    try:
+        if dc is not None:
+            s = str(dc).strip().upper()
+            return s.startswith("C") or ("대변" in s)
+    except Exception:
+        pass
+    try:
+        t = str(account_type or "").strip()
+        return t in {"부채", "자본", "수익"}
+    except Exception:
+        return False

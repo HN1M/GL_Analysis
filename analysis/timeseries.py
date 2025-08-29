@@ -158,7 +158,10 @@ def _rolling_origin_cv(
 ) -> float:
     y = y.dropna(); n = len(y)
     if n < max(min_train + k, 8):
-        m = fit_fn(y); yhat = pred_fn(m)
+        try:
+            m = fit_fn(y); yhat = pred_fn(m)
+        except Exception:
+            return 999.0
         yhat = np.asarray(yhat)[:n] if yhat is not None else np.repeat(y.iloc[:1].values, n)
         return _smape(y.values, yhat)
     step = max((n - min_train) // (k + 1), 1)
@@ -166,8 +169,11 @@ def _rolling_origin_cv(
     for i in range(min_train, n, step):
         tr = y.iloc[:i]; te = y.iloc[i:i+step]
         if te.empty: break
-        m = fit_fn(tr); yh = pred_fn(m, steps=len(te))
-        scores.append(_smape(te.values, np.asarray(yh)[:len(te)]))
+        try:
+            m = fit_fn(tr); yh = pred_fn(m, steps=len(te))
+            scores.append(_smape(te.values, np.asarray(yh)[:len(te)]))
+        except Exception:
+            scores.append(999.0)
     return float(np.mean(scores)) if scores else 999.0
 
 def _choose_model(y: pd.Series, measure: str) -> Tuple[str, np.ndarray]:
@@ -381,3 +387,63 @@ def run_timeseries_module_with_flag(
                 out["assertion"] = "E"
         outs.append(out)
     return pd.concat(outs, ignore_index=True) if outs else pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
+
+# ----------------------- Helper: in-sample prediction -------------------
+def insample_predict_df(
+    monthly: pd.DataFrame,
+    value_col: str,
+    measure: str,
+    pm_value: float = _PM_DEFAULT,
+) -> pd.DataFrame:
+    """
+    월별 데이터(monthly: ['date', value_col])에 대해 MoR이 고른 모델의 in-sample 예측선을 반환.
+    반환 컬럼: date, actual, predicted, model, train_months, data_span, sigma_win
+    """
+    df = _prepare_monthly(monthly, "date")
+    if df.empty or value_col not in df.columns:
+        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win"])
+    y = pd.Series(df[value_col].astype(float).values, index=pd.PeriodIndex(df["_p"], freq="M"))
+    if len(y) < 2:
+        return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win"])
+    model, yhat = _choose_model(y, measure=measure)
+    span = f"{y.index[0].strftime('%Y-%m')} ~ {y.index[-1].strftime('%Y-%m')}"
+    out = pd.DataFrame({
+        "date": y.index.to_timestamp(),
+        "actual": y.values,
+        "predicted": yhat,
+        "model": model,
+    })
+    out["train_months"] = len(y)
+    out["data_span"] = span
+    out["sigma_win"] = 6  # z 계산에 쓰는 최근 분산 윈도우
+    return out
+
+
+# ------------------- Validation: reconcile with trend -------------------
+def reconcile_with_trend(
+    ts_flow: pd.Series,
+    ts_bal: pd.Series,
+    trend_flow: pd.Series,
+    trend_bal: pd.Series,
+    tol: int = 1,
+) -> pd.DataFrame:
+    """
+    timeseries 입력(flow/balance)과 trend 산출치(flow/balance)를 월별 대조.
+    tol 절대차(원) 초과인 행만 반환.
+    """
+    import pandas as _pd
+    idx = sorted(set(_pd.to_datetime(getattr(ts_flow, 'index', [])).tolist()) |
+                 set(_pd.to_datetime(getattr(trend_flow, 'index', [])).tolist()))
+    rows = []
+    for d in idx:
+        af = int(_pd.Series(ts_flow).get(d, 0))
+        tf = int(_pd.Series(trend_flow).get(d, 0))
+        ab = int(_pd.Series(ts_bal).get(d, 0))
+        tb = int(_pd.Series(trend_bal).get(d, 0))
+        rows.append({
+            "month": d,
+            "flow(ts)": af, "flow(trend)": tf, "Δflow": af - tf,
+            "bal(ts)": ab,  "bal(trend)": tb,  "Δbal": ab - tb,
+        })
+    df_chk = pd.DataFrame(rows).set_index("month")
+    return df_chk[(df_chk["Δflow"].abs() > tol) | (df_chk["Δbal"].abs() > tol)]
