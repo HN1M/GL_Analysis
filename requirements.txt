@@ -1,16 +1,19 @@
-# runtime
-pandas>=2.2,<3
-numpy>=1.26,<3
-plotly>=5.22,<6
-streamlit>=1.36,<2
-python-dotenv>=1.0,<2
-openai>=1.40,<2
-tiktoken>=0.7,<1
-scikit-learn>=1.5,<2
-umap-learn>=0.5,<1
-scipy>=1.13,<2
-kaleido>=0.2,<1
-statsmodels>=0.14
-pmdarima>=2.0      # optional
-prophet==1.1.5 ; python_version < "3.12"
-cmdstanpy>=1.2 ; python_version < "3.12"
+# --- 핵심 애플리케이션 및 UI ---
+streamlit
+pandas
+numpy
+
+# --- 데이터 시각화 ---
+plotly
+
+# --- LLM 및 임베딩 ---
+openai
+python-dotenv
+tiktoken
+
+# --- 머신러닝 및 데이터 분석 ---
+scikit-learn # KMeans, NearestNeighbors, silhouette_score 등에 사용
+umap-learn   # 고차원 데이터 임베딩 시각화 및 차원 축소
+statsmodels  # ARIMA 시계열 모델
+prophet      # 시계열 예측 모델
+scipy        # Hungarian 매칭(linear_sum_assignment) 등 과학 계산

@@ -1,4 +1,7 @@
--r requirements.txt
-pytest>=8.0,<9
-pytest-cov>=5,<6
+# requirements-dev.txt
 
+# 앱 실행에 필요한 기본 라이브러리 포함
+-r requirements.txt
+
+# --- 개발 및 테스트용 ---
+pytest
