@@ -1,0 +1,1277 @@
+# app_v0.17.py (거래처 상세 분석 오류 수정)
+# --- BEGIN: LLM 키 부팅 보장 ---
+try:
+    from infra.env_loader import boot as _llm_boot
+    _llm_boot()  # 키 로드 + 상태 로그
+except Exception as _e:
+    # 최악의 경우에도 앱은 뜨게 하고, 상태를 stderr로만 알림
+    import sys
+    print(f"[env_loader] 초기화 실패: {_e}", file=sys.stderr)
+# --- END: LLM 키 부팅 보장 ---
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
+from pathlib import Path
+from utils.helpers import find_column_by_keyword, add_provenance_columns, add_period_tag
+from analysis.integrity import analyze_reconciliation
+from analysis.contracts import LedgerFrame, ModuleResult
+from analysis.trend import create_monthly_trend_figure, run_trend_module
+from analysis.anomaly import run_anomaly_module, compute_amount_columns
+from analysis.correlation import run_correlation_module
+from analysis.vendor import (
+    create_pareto_figure,
+    create_vendor_heatmap,
+    create_vendor_detail_figure,
+    run_vendor_module,
+)
+from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note
+from analysis.embedding import (
+    ensure_rich_embedding_text,
+    perform_embedding_and_clustering,
+    perform_embedding_only,
+)
+from analysis.anomaly import calculate_grouped_stats_and_zscore
+from services.llm import LLMClient
+from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU
+try:
+    from config import PM_DEFAULT, PROVISIONAL_RULE_NAME, provisional_risk_formula_str
+except Exception:
+    PM_DEFAULT = 500_000_000
+from utils.viz import add_materiality_threshold, add_pm_badge
+from analysis.assertion_risk import build_matrix
+
+# --- KRW 입력(천단위 콤마) 유틸: 콜백 기반으로 안정화 ---
+def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "") -> int:
+    """
+    한국 원화 입력 위젯(천단위 콤마). 핵심 규칙:
+    1) 위젯 키(pm_value__txt 등)를 런 루프에서 직접 대입하지 않는다.
+    2) 콤마 재포맷은 on_change 콜백 안에서만 수행한다.
+    3) 분석에 쓰는 정수 값은 st.session_state[key]에 보관한다.
+    """
+    txt_key = f"{key}__txt"  # 실제 text_input 위젯이 바인딩되는 키
+
+    # 초기 셋업: 숫자/문자 상태를 위젯 생성 전에 준비
+    if key not in st.session_state:
+        st.session_state[key] = int(default_value)
+    if txt_key not in st.session_state:
+        st.session_state[txt_key] = f"{int(st.session_state[key]):,}"
+
+    # 콜백: 포커스 아웃/Enter 시 콤마 포맷을 적용하고 숫자 상태를 동기화
+    def _on_blur_format():
+        raw_now = st.session_state.get(txt_key, "")
+        digits = re.sub(r"[^\d]", "", str(raw_now or ""))
+        val = int(digits) if digits else 0
+        if val < 0:
+            val = 0
+        st.session_state[key] = int(val)            # 분석에 쓰는 정수 상태
+        st.session_state[txt_key] = f"{int(val):,}"  # 위젯 표시 텍스트(콤마)
+
+    # 위젯 생성
+    raw = st.text_input(
+        label,
+        value=st.session_state[txt_key],
+        key=txt_key,
+        help=help_text,
+        placeholder="예: 500,000,000",
+        on_change=_on_blur_format,
+    )
+
+    # 라이브 타이핑 동안에도 그래프가 즉시 반영되도록 정수 상태만 업데이트(위젯 키는 건드리지 않음)
+    digits_live = re.sub(r"[^\d]", "", str(raw or ""))
+    live_val = int(digits_live) if digits_live else 0
+    if live_val < 0:
+        live_val = 0
+    st.session_state[key] = int(live_val)
+
+    return int(st.session_state[key])
+
+
+# --- 3. UI 부분 ---
+st.set_page_config(page_title="AI 분석 시스템 v0.18", layout="wide")
+st.title("AI 분석 시스템 v0.18: 최종 개선 🏗️")
+st.markdown("---")
+
+for key in ['mapping_confirmed', 'analysis_done']:
+    if key not in st.session_state:
+        st.session_state[key] = False
+
+
+# (removed) number_input 기반 대체 구현: 쉼표 미표시·키 충돌 유발 가능성 → 단일 구현으로 통일
+
+with st.sidebar:
+    st.header("1. 데이터 준비")
+    uploaded_file = st.file_uploader("분석할 엑셀 파일을 올려주세요.", type=["xlsx", "xlsm"])
+    if 'last_file' not in st.session_state or st.session_state.last_file != uploaded_file:
+        st.session_state.mapping_confirmed = False
+        st.session_state.analysis_done = False
+        st.session_state.last_file = uploaded_file
+
+    st.markdown("---")
+    st.header("2. 분석 기간")
+    default_scope = st.session_state.get("period_scope", "당기")
+    st.session_state.period_scope = st.radio(
+        "분석 스코프(트렌드 제외):",
+        options=["당기", "당기+전기"],
+        index=["당기","당기+전기"].index(default_scope),
+        horizontal=True,
+        help="상관/거래처/이상치 모듈에 적용됩니다. 트렌드는 설계상 CY vs PY 비교 유지."
+    )
+    st.markdown("---")
+    st.header("3. Embedding / Clustering")
+    st.session_state.use_large_embedding = st.toggle(
+        "Use Large Embedding (cost ↑)",
+        value=st.session_state.get("use_large_embedding", EMB_USE_LARGE_DEFAULT),
+        help="Large model improves semantics but is slower and more expensive."
+    )
+    st.session_state.rescue_tau = st.slider(
+        "Noise rescue τ (cosine)",
+        min_value=0.60, max_value=0.90, step=0.01,
+        value=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
+        help="Reassign -1 (noise) to nearest cluster if similarity ≥ τ."
+    )
+    st.markdown("---")
+    st.header("4. Materiality")
+    pm_val = _krw_input(
+        "Performance Materiality (KRW)",
+        key="pm_value",
+        default_value=PM_DEFAULT,
+        help_text="Used for KIT (PM exceed) and integrated risk scoring."
+    )
+    st.caption("ⓘ The PM threshold is drawn as a red dotted line on applicable charts. "
+               "Y-axis scaling may change to accommodate this line.")
+
+    # 🧹 캐시 관리
+    with st.expander("🧹 캐시 관리", expanded=False):
+        if st.button("임베딩 캐시 비우기"):
+            import shutil
+            from services.cache import _model_dir
+            for m in ["text-embedding-3-small", "text-embedding-3-large"]:
+                try:
+                    shutil.rmtree(_model_dir(m), ignore_errors=True)
+                except Exception as e:
+                    st.warning(f"{m} 삭제 실패: {e}")
+            st.success("임베딩 캐시 삭제 완료")
+
+        if st.button("데이터 캐시 비우기"):
+            st.cache_data.clear()
+            st.success("Streamlit 데이터 캐시 삭제 완료")
+
+        if st.button("캐시 정보 보기"):
+            from services.cache import get_cache_info
+            try:
+                st.write(get_cache_info("text-embedding-3-small"))
+                st.write(get_cache_info("text-embedding-3-large"))
+            except Exception as e:
+                st.info(f"정보 조회 실패: {e}")
+
+
+@st.cache_data(show_spinner=False)
+def _read_excel(_file, sheet_name=None):
+    return pd.read_excel(_file, sheet_name=sheet_name)
+
+
+@st.cache_data(show_spinner=False)
+def _read_xls(_file):
+    # pickle 직렬화 가능한 타입만 캐시 → 시트명 리스트로 반환
+    return pd.ExcelFile(_file).sheet_names
+
+# (removed duplicated definition) _krw_input — 위의 단일 버전만 유지
+
+def _apply_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
+    """스코프 적용 시 결측 컬럼 방어: 'period_tag' 미존재면 원본 반환.
+    df.get('period_tag','')가 문자열을 반환할 경우 .eq 호출 AttributeError를 방지한다.
+    """
+    if df is None or df.empty or 'period_tag' not in df.columns:
+        return df
+    if scope == "당기":
+        return df[df['period_tag'].eq('CY')]
+    if scope == "당기+전기":
+        return df[df['period_tag'].isin(['CY', 'PY'])]
+    return df
+
+def _lf_by_scope() -> LedgerFrame:
+    """상관/거래처/이상치에서 사용할 스코프 적용 LedgerFrame."""
+    hist = st.session_state.get('lf_hist')
+    scope = st.session_state.get('period_scope', '당기')
+    if hist is None:
+        return None
+    return LedgerFrame(df=_apply_scope(hist.df, scope), meta=hist.meta)
+
+# (removed) 구버전 텍스트입력 + ±step / ✖reset 변형들 — 사용자 요청으로 버튼류 삭제 및 단일화
+
+
+if uploaded_file is not None:
+    if not st.session_state.mapping_confirmed:
+        # ... 컬럼 매핑 UI ...
+        try:
+            st.info("2단계: 엑셀의 컬럼을 분석 표준 필드에 맞게 지정해주세요.")
+            sheet_names = _read_xls(uploaded_file)
+            first_ledger_sheet = next((s for s in sheet_names if 'ledger' in s.lower()), None)
+            if first_ledger_sheet is None:
+                st.error("오류: 'Ledger' 시트를 찾을 수 없습니다.")
+                st.stop()
+            ledger_cols = _read_excel(uploaded_file, sheet_name=first_ledger_sheet).columns.tolist()
+            ledger_map = {}
+            st.markdown("#### **Ledger 시트** 항목 매핑")
+            cols = st.columns(6)
+            ledger_fields = {'회계일자': '일자', '계정코드': '계정코드', '거래처': '거래처', '적요': '적요', '차변': '차변', '대변': '대변'}
+            for i, (key, keyword) in enumerate(ledger_fields.items()):
+                with cols[i]:
+                    is_optional = key == '거래처'
+                    default_col = find_column_by_keyword(ledger_cols, keyword)
+                    options = ['선택 안 함'] + ledger_cols if is_optional else ledger_cols
+                    default_index = options.index(default_col) if default_col in options else 0
+                    ledger_map[key] = st.selectbox(f"**'{key}'** 필드 선택", options, index=default_index, key=f"map_ledger_{key}")
+            st.markdown("---")
+            st.markdown("#### **Master 시트** 항목 매핑")
+            master_cols = _read_excel(uploaded_file, sheet_name='Master').columns.tolist()
+            master_map = {}
+            cols = st.columns(7)
+            master_fields = {'계정코드': '계정코드', '계정명': '계정명', 'BS/PL': 'BS/PL', '차변/대변': '차변/대변', '당기말잔액': '당기말', '전기말잔액': '전기말', '전전기말잔액': '전전기말'}
+            for i, (key, keyword) in enumerate(master_fields.items()):
+                with cols[i]:
+                    default_col = find_column_by_keyword(master_cols, keyword)
+                    default_index = master_cols.index(default_col) if default_col in master_cols else 0
+                    master_map[key] = st.selectbox(f"**'{key}'** 필드 선택", master_cols, index=default_index, key=f"map_master_{key}")
+            if st.button("✅ 매핑 확인 및 데이터 처리", type="primary"):
+                st.session_state.ledger_map = ledger_map
+                st.session_state.master_map = master_map
+                st.session_state.mapping_confirmed = True
+                st.rerun()
+        except Exception as e:
+            st.error(f"엑셀 파일의 컬럼을 읽는 중 오류가 발생했습니다: {e}")
+
+    else:  # 매핑 확인 후
+        try:
+            ledger_map, master_map = st.session_state.ledger_map, st.session_state.master_map
+            master_df = _read_excel(uploaded_file, sheet_name='Master')
+            sheet_names = _read_xls(uploaded_file)
+            ledger_sheets = [s for s in sheet_names if 'ledger' in s.lower()]
+            all_parts = []
+            for s in ledger_sheets:
+                part = _read_excel(uploaded_file, sheet_name=s)
+                part['source_sheet'] = s
+                part = add_provenance_columns(part)
+                all_parts.append(part)
+            ledger_df = pd.concat(all_parts, ignore_index=True)
+            # row_id: 파일명|시트:행  (세션/재실행에도 안정)
+            try:
+                base = Path(getattr(uploaded_file, "name", "uploaded.xlsx")).stem
+                if 'row_id' in ledger_df.columns:
+                    ledger_df['row_id'] = base + "|" + ledger_df['row_id'].astype(str)
+            except Exception:
+                pass
+            ledger_df.rename(columns={v: k for k, v in ledger_map.items() if v != '선택 안 함'}, inplace=True)
+            master_df.rename(columns={v: k for k, v in master_map.items()}, inplace=True)
+
+            # 🔧 병합 전에 타입/포맷을 먼저 통일
+            for df_ in [ledger_df, master_df]:
+                if '계정코드' in df_.columns:
+                    df_['계정코드'] = (
+                        df_['계정코드']
+                        .astype(str)
+                        .str.replace(r'\.0$', '', regex=True)
+                        .str.strip()
+                    )
+
+            master_essentials = master_df[['계정코드', '계정명']].drop_duplicates()
+            ledger_df = pd.merge(ledger_df, master_essentials, on='계정코드', how='left')
+            ledger_df['계정명'] = ledger_df['계정명'].fillna('미지정 계정')
+
+            ledger_df['회계일자'] = pd.to_datetime(ledger_df['회계일자'], errors='coerce')
+            ledger_df.dropna(subset=['회계일자'], inplace=True)
+            for col in ['차변', '대변']:
+                ledger_df[col] = pd.to_numeric(ledger_df[col], errors='coerce').fillna(0)
+            for col in ['당기말잔액', '전기말잔액', '전전기말잔액']:
+                if col in master_df.columns:
+                    master_df[col] = pd.to_numeric(master_df[col], errors='coerce').fillna(0)
+                else:
+                    master_df[col] = 0
+            ledger_df['거래금액'] = ledger_df['차변'] - ledger_df['대변']
+            ledger_df['거래금액_절대값'] = abs(ledger_df['거래금액'])
+            ledger_df['연도'] = ledger_df['회계일자'].dt.year
+            ledger_df['월'] = ledger_df['회계일자'].dt.month
+            # ✅ 분석 규칙: 계정 서브셋 분석 시에도 전체 히스토리를 확보하기 위한 편의 파생
+            ledger_df['연월'] = ledger_df['회계일자'].dt.to_period('M').astype(str)
+            # ✅ period_tag 추가(CY/PY/Other)
+            ledger_df = add_period_tag(ledger_df)
+            if '거래처' not in ledger_df.columns:
+                ledger_df['거래처'] = '정보 없음'
+            ledger_df['거래처'] = ledger_df['거래처'].fillna('정보 없음').astype(str)
+
+            if st.button("🚀 전체 분석 실행", type="primary"):
+                with st.spinner('데이터를 분석 중입니다...'):
+                    # ✅ 정합성은 사용자 기간 선택과 무관하게 전체 기준으로 계산
+                    st.session_state.recon_status, st.session_state.recon_df = analyze_reconciliation(ledger_df, master_df)
+                    # ✅ 표준 LedgerFrame 구성(정합성은 항상 전체 기준: DF_hist)
+                    lf_hist = LedgerFrame(df=ledger_df, meta={
+                        "file_name": getattr(uploaded_file, "name", "uploaded.xlsx"),
+                        "master_df": master_df,
+                    })
+                    # 초기엔 focus=hist (후속 단계에서 사용자 필터 연결)
+                    lf_focus = lf_hist
+
+                    st.session_state.master_df = master_df
+                    st.session_state.ledger_df = ledger_df
+                    st.session_state.lf_hist = lf_hist
+                    st.session_state.lf_focus = lf_focus
+                    st.session_state.analysis_done = True
+                st.rerun()
+
+            if st.session_state.analysis_done:
+                st.success("✅ 분석이 완료되었습니다. 아래 탭에서 결과를 확인하세요.")
+                with st.expander("🔍 빠른 진단(데이터 품질 체크)", expanded=False):
+                    df = st.session_state.ledger_df.copy()
+                    issues = []
+
+                    invalid_date = int(df['회계일자'].isna().sum())
+                    if invalid_date > 0:
+                        issues.append(f"❗ 유효하지 않은 날짜(NaT): {invalid_date:,}건")
+
+                    if '거래처' in df.columns:
+                        missing_vendor = int((df['거래처'].isna() | (df['거래처'] == '정보 없음')).sum())
+                        if missing_vendor > 0:
+                            issues.append(f"ℹ️ 거래처 정보 없음/결측: {missing_vendor:,}건")
+
+                    zero_abs = int((df['거래금액_절대값'] == 0).sum())
+                    issues.append(f"ℹ️ 금액 절대값이 0인 전표: {zero_abs:,}건")
+
+                    unlinked = int(df['계정명'].eq('미지정 계정').sum())
+                    if unlinked > 0:
+                        issues.append(f"❗ Master와 매칭되지 않은 전표(계정명 미지정): {unlinked:,}건")
+
+                    st.write("**체크 결과**")
+                    if issues:
+                        for line in issues:
+                            st.write("- " + line)
+                    else:
+                        st.success("문제 없이 깔끔합니다!")
+                tab1, tab2, tab3, tab4, tab_ts, tab5, tab6 = st.tabs(["📈 대시보드", "🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열/예측", "⚠️ 위험 평가", "🤖 AI 리포트"])
+
+                with tab1:  # ...
+                    st.header("핵심 요약 대시보드")
+                    recon_status, ledger_df_res = st.session_state.recon_status, st.session_state.ledger_df
+                    st.subheader("데이터 현황")
+                    kpi_cols = st.columns(3)
+                    kpi_cols[0].metric("총 거래 건수", f"{len(ledger_df_res):,} 건")
+                    kpi_cols[1].metric("총 거래 금액 (절대값)", f"{st.session_state.ledger_df['거래금액_절대값'].sum():,.0f} 원")
+                    kpi_cols[2].metric("분석 대상 계정 수", f"{ledger_df_res['계정코드'].nunique()} 개")
+                    st.subheader("데이터 무결성")
+                    if recon_status == 'Pass':
+                        st.success("✅ 데이터 정합성: 모든 계정 일치")
+                    elif recon_status == 'Warning':
+                        st.warning("⚠️ 데이터 정합성: 일부 계정에서 사소한 차이 발견")
+                    else:
+                        st.error("🚨 데이터 정합성: 일부 계정에서 중대한 차이 발견")
+                with tab2:  # ...
+                    st.header("데이터 무결성 및 흐름")
+                    st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
+                    st.subheader("1. 데이터 정합성 검증 결과")
+                    status, result_df = st.session_state.recon_status, st.session_state.recon_df
+                    if status == "Pass":
+                        st.success("✅ 모든 계정의 데이터가 일치합니다.")
+                    elif status == "Warning":
+                        st.warning("⚠️ 일부 계정에서 사소한 차이가 발견되었습니다.")
+                    else:
+                        st.error("🚨 일부 계정에서 중대한 차이가 발견되었습니다.")
+
+                    def highlight_status(row):
+                        if row.상태 == 'Fail':
+                            return ['background-color: #ffcccc'] * len(row)
+                        elif row.상태 == 'Warning':
+                            return ['background-color: #fff0cc'] * len(row)
+                        return [''] * len(row)
+
+                    format_dict = {col: '{:,.0f}' for col in result_df.select_dtypes(include=np.number).columns}
+                    st.dataframe(result_df.style.apply(highlight_status, axis=1).format(format_dict), use_container_width=True)
+                    st.markdown("---")
+                    st.subheader("2. 계정별 월별 추이 (PY vs CY)")
+                    # ✅ 자동 추천 제거: 사용자가 계정을 선택한 경우에만 그래프 렌더
+                    account_list = st.session_state.master_df['계정명'].unique()
+                    selected_accounts = st.multiselect(
+                        "분석할 계정을 선택하세요 (1개 이상 필수)",
+                        account_list, default=[]
+                    )
+                    if not selected_accounts:
+                        st.info("계정을 1개 이상 선택하면 월별 추이 그래프가 표시됩니다.")
+                    else:
+                        lf_use = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
+                        # 선택된 계정명을 계정코드로 변환
+                        mdf = st.session_state.master_df
+                        accounts_codes = (
+                            mdf[mdf['계정명'].isin(selected_accounts)]['계정코드']
+                            .astype(str)
+                            .tolist()
+                        )
+                        mod = run_trend_module(lf_use, accounts=accounts_codes)
+                        for w in mod.warnings:
+                            st.warning(w)
+                        if mod.figures:
+                            for title, fig in mod.figures.items():
+                                # PM 임계선(항상 표시; 범위 밖이면 자동 확장)
+                                st.plotly_chart(
+                                    add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT))),
+                                    use_container_width=True
+                                )
+                        else:
+                            st.info("표시할 추이 그래프가 없습니다.")
+
+                    st.markdown("---")
+                    st.subheader("3. 계정 간 상관 히트맵")
+                    # ✅ 버튼 없이 즉시 렌더: 계정 2개 이상 선택 + 임계치 슬라이더 제공
+                    corr_accounts = st.multiselect(
+                        "상관 분석 대상 계정(2개 이상 선택)",
+                        account_list,
+                        default=selected_accounts,
+                        help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다."
+                    )
+                    corr_thr = st.slider(
+                        "상관 임계치(강한 상관쌍 표 전용)",
+                        min_value=0.50, max_value=0.95, step=0.05, value=0.70,
+                        help="절대값 기준 임계치 이상인 계정쌍만 표에 표시합니다."
+                    )
+                    if len(corr_accounts) < 2:
+                        st.info("계정을 **2개 이상** 선택하면 히트맵이 표시됩니다.")
+                    else:
+                        lf_use = _lf_by_scope()
+                        mdf = st.session_state.master_df
+                        codes = mdf[mdf['계정명'].isin(corr_accounts)]['계정코드'].astype(str).tolist()
+                        cmod = run_correlation_module(lf_use, accounts=codes, corr_threshold=float(corr_thr))
+                        for w in cmod.warnings:
+                            st.warning(w)
+                        if cmod.figures:
+                            st.plotly_chart(cmod.figures['heatmap'], use_container_width=True)
+                        if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
+                            st.markdown("**임계치 이상 상관쌍**")
+                            st.dataframe(cmod.tables['strong_pairs'], use_container_width=True)
+                        if 'excluded_accounts' in cmod.tables and not cmod.tables['excluded_accounts'].empty:
+                            with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
+                                st.dataframe(cmod.tables['excluded_accounts'], use_container_width=True)
+
+                with tab3:
+                    st.header("거래처 심층 분석")
+                    st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
+
+                    st.subheader("거래처 집중도 및 활동성 (계정별)")
+                    master_df_res = st.session_state.master_df
+                    account_list_vendor = master_df_res['계정명'].unique()
+                    selected_accounts_vendor = st.multiselect("분석할 계정(들)을 선택하세요.", account_list_vendor, default=[])
+
+                    # 🔧 최소 거래금액(연간, CY) 필터 — KRW 입력(커밋 시 쉼표 정규화)
+                    min_amount_vendor = _krw_input(
+                        "최소 거래금액(연간, CY) 필터",
+                        key="vendor_min_amount",
+                        default_value=0,
+                        help_text="CY 기준 거래금액 합계가 이 값 미만인 거래처는 '기타'로 합산됩니다."
+                    )
+                    include_others_vendor = st.checkbox("나머지는 '기타'로 합산", value=True)
+
+                    if selected_accounts_vendor:
+                        selected_codes = (
+                            master_df_res[master_df_res['계정명'].isin(selected_accounts_vendor)]['계정코드']
+                            .astype(str)
+                            .tolist()
+                        )
+                        lf_use = _lf_by_scope()
+                        vmod = run_vendor_module(
+                            lf_use,
+                            account_codes=selected_codes,
+                            min_amount=float(min_amount_vendor),
+                            include_others=bool(include_others_vendor),
+                        )
+                        if vmod.figures:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                if 'pareto' in vmod.figures:
+                                    figp = vmod.figures['pareto']
+                                    figp = add_materiality_threshold(figp, float(st.session_state.get("pm_value", PM_DEFAULT)))
+                                    st.plotly_chart(figp, use_container_width=True)
+                            with col2:
+                                if 'heatmap' in vmod.figures:
+                                    figh = add_pm_badge(vmod.figures['heatmap'], float(st.session_state.get("pm_value", PM_DEFAULT)))
+                                    st.plotly_chart(figh, use_container_width=True)
+                        else:
+                            st.warning("선택하신 계정에는 분석할 거래처 데이터가 부족합니다.")
+                        for w in vmod.warnings:
+                            st.warning(w)
+                    else:
+                        st.info("계정을 선택하면 해당 계정의 거래처 집중도 및 활동성 분석을 볼 수 있습니다.")
+
+                    st.markdown("---")
+                    st.subheader("거래처별 세부 분석 (전체 계정)")
+                    full_ledger_df = st.session_state.ledger_df
+                    vendor_list = sorted(full_ledger_df[full_ledger_df['거래처'] != '정보 없음']['거래처'].unique())
+
+                    if len(vendor_list) > 0:
+                        options = ['선택하세요...'] + vendor_list
+                        selected_vendor = st.selectbox("상세 분석할 거래처를 선택하세요.", options, index=0)
+
+                        if selected_vendor != '선택하세요...':
+                            all_months_in_data = pd.period_range(
+                                start=full_ledger_df['회계일자'].min(),
+                                end=full_ledger_df['회계일자'].max(),
+                                freq='M'
+                            ).strftime('%Y-%m').tolist()
+                            detail_fig = create_vendor_detail_figure(full_ledger_df, selected_vendor, all_months_in_data)
+                            # PM line on vendor detail (stacked bars)
+                            try:
+                                detail_fig = add_materiality_threshold(detail_fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
+                            except Exception:
+                                pass
+                            if detail_fig:
+                                st.plotly_chart(detail_fig, use_container_width=True)
+                    else:
+                        st.info("분석할 거래처 데이터가 없습니다.")
+
+                with tab4:
+                    st.header("이상 패턴 탐지 (v1: Z-Score)")
+                    st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
+                    mdf = st.session_state.master_df
+                    acct_names = mdf['계정명'].unique()
+                    pick = st.multiselect("대상 계정 선택(미선택 시 자동 추천)", acct_names, default=[])
+                    topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=500, value=20, step=10)
+                    if st.button("이상치 분석 실행"):
+                        lf_use = _lf_by_scope()
+                        codes = None
+                        if pick:
+                            codes = mdf[mdf['계정명'].isin(pick)]['계정코드'].astype(str).tolist()
+                        amod = run_anomaly_module(lf_use, target_accounts=codes, topn=topn, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                        for w in amod.warnings: st.warning(w)
+                        if 'anomaly_top' in amod.tables:
+                            _tbl = amod.tables['anomaly_top'].copy()
+                            fmt = {}
+                            if '발생액' in _tbl.columns: fmt['발생액'] = '{:,.0f}'
+                            if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:.2f}'
+                            st.dataframe(_tbl.style.format(fmt), use_container_width=True)
+                        if 'zscore_hist' in amod.figures:
+                            st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True)
+
+                with tab_ts:
+                    st.header("시계열 예측(MoR) — 마지막 포인트 요약 + 라인차트")
+                    st.caption("※ 기본값은 '월별 발생액(Δ잔액)'이며, BS 계정은 잔액(balance) 기준도 병행합니다.")
+                    with st.expander("📘 해석 가이드", expanded=False):
+                        st.markdown(
+                            "- **error = 실제 − 예측** (양수면 예상보다 큼)\n"
+                            "- **z**: error가 과거 변동성(σ) 대비 몇 σ인지 (±2 주의, ±3 이례)\n"
+                            "- **risk**: |z|, PM 대비 비중, KIT 여부를 결합한 0~1 점수"
+                        )
+                        st.caption("금액 단위가 큰 계정은 금액 자체보다 z 크기를 우선적으로 보세요.")
+                    lf_use = _lf_by_scope()
+                    mdf = st.session_state.master_df
+                    dfm = lf_use.df.copy()
+                    dfm['연월'] = dfm['회계일자'].dt.to_period('M').dt.to_timestamp('M')
+                    agg = (dfm.groupby(['계정명','연월'])['거래금액'].sum()
+                               .reset_index().rename(columns={'계정명':'account','연월':'date','거래금액':'amount'}))
+                    pick_accounts_ts = st.multiselect("대상 계정", sorted(agg['account'].unique()), default=[], key="ts_accounts")
+                    use_ts = agg if not pick_accounts_ts else agg[agg['account'].isin(pick_accounts_ts)]
+                    from analysis.timeseries import run_timeseries_module as _ts_run
+                    res = _ts_run(use_ts.rename(columns={'account':'account','date':'date','amount':'amount'}),
+                                  account_col='account', date_col='date', amount_col='amount',
+                                  pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                    if not res.empty:
+                        out = res.copy()
+                        out = out.rename(columns={'account':'계정'})
+                        for c in ['actual','predicted','error','z','risk']:
+                            out[c] = pd.to_numeric(out[c], errors='coerce')
+                        _disp = out[['date','계정','actual','predicted','error','z','risk']].rename(columns={
+                            'predicted': '예상 발생액(월 합계)',
+                            'error': '차이(실제-예상)'
+                        })
+                        st.caption("MoR(최적 모델) 기준. BS는 balance 기준도 병행 계산합니다(요약 테이블에는 flow가 기본).")
+                        st.dataframe(_disp.style.format({
+                            'actual':'{:,.0f}', '예상 발생액(월 합계)':'{:,.0f}', '차이(실제-예상)':'{:,.0f}', 'z':'{:+.2f}', 'risk':'{:.2f}'
+                        }), use_container_width=True)
+                    else:
+                        st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")
+                with tab5:
+                    st.header("계정 × 주장(CEAVOP) 위험 평가")
+                    # 잠정 기준 안내 배지
+                    try:
+                        st.info(f"ⓘ 통합 위험점수는 {PROVISIONAL_RULE_NAME}에 따라 {provisional_risk_formula_str()}로 계산되었습니다.")
+                        st.caption("ⓘ CEAVOP 주장은 기본 규칙(예: 예측 상회→E, 하회→C)에 따라 자동 제안되었으며, 전문가의 검토가 필요합니다.")
+                    except Exception:
+                        pass
+                    st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')} · PM={float(st.session_state.get('pm_value', PM_DEFAULT)):,.0f}원")
+                    # ✅ 한글 가이드: 좌/우 2열 레이아웃
+                    g_left, g_right = st.columns([0.48, 0.52])
+                    with g_left:
+                        st.markdown("#### 어떻게 읽나요?")
+                        st.markdown(
+                            "- 히트맵의 각 셀은 **계정 × 주장** 조합에 대한 통합 위험점수(0~1)의 *최대값*입니다.\n"
+                            "- 위험점수는 **|Z-Score|**, **PM 대비 금액비율**, **Key Item(PM 초과)** 여부를 결합합니다.\n"
+                            "- 좌측 사이드바의 **Performance Materiality(PM)** 를 조정하면 KIT 플래그와 히트맵 강도가 함께 변합니다."
+                        )
+                        st.markdown("#### CEAVOP(주장) 간단 해설")
+                        st.info(
+                            "C(완전성): 누락 없이 모두 반영되었는가?\n\n"
+                            "E(존재): 기록된 거래가 실제 존재하는가?\n\n"
+                            "A(정확성): 금액/계산이 정확한가?\n\n"
+                            "V(평가·배분): 적절한 평가·배분이 되었는가?\n\n"
+                            "O(발생): 발생사실/권리·의무가 타당한가?\n\n"
+                            "P(표시·공시): 적절히 분류·표시·공시되었는가?"
+                        )
+                    with g_right:
+                        st.markdown("#### 히트맵")
+                    lf_use = _lf_by_scope()
+                    # 전체 스코프 기준으로 이상치 모듈을 실행(리스크 에비던스 확보)
+                    amod_full = run_anomaly_module(lf_use, target_accounts=None, topn=200, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+
+                    # --- [ADD] 타임시리즈 Evidence 생성 & 결합 ---
+                    from analysis.timeseries import run_timeseries_module
+                    from analysis.contracts import EvidenceDetail, ModuleResult
+                    from analysis.anomaly import _risk_from  # anomaly_score 정합성 유지용
+
+                    pm_cur = float(st.session_state.get("pm_value", PM_DEFAULT))
+
+                    # 1) 월 시계열 집계(계정 × 월, 금액=거래금액 합계)
+                    ts_base = lf_use.df.copy()
+                    ts_base['연월'] = ts_base['회계일자'].dt.to_period('M')
+                    ts_monthly = (
+                        ts_base.groupby(['계정코드','계정명','연월'], as_index=False)['거래금액']
+                               .sum()
+                    )
+                    # run_timeseries_module는 account/date/amount 3컬럼만 사용 → code|name로 메타 보존
+                    ts_monthly['account'] = ts_monthly.apply(lambda r: f"{str(r['계정코드'])}|{str(r['계정명'])}", axis=1)
+                    ts_monthly['date'] = ts_monthly['연월'].dt.to_timestamp('M')
+                    ts_monthly['amount'] = ts_monthly['거래금액']
+
+                    def _ts_adapter(r: dict) -> EvidenceDetail:
+                        # r: {'account','date','amount','predicted','error','z','z_abs','assertion','risk',...}
+                        acc_key = str(r.get('account', ''))
+                        if '|' in acc_key:
+                            acc_code, acc_name = acc_key.split('|', 1)
+                        else:
+                            acc_code, acc_name = acc_key, acc_key
+                        dt = r.get('date')
+                        yyyymm = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)
+                        a, f, k, score = _risk_from(float(r.get('z_abs', 0.0)), float(r.get('amount', 0.0)), pm_cur)
+                        return EvidenceDetail(
+                            row_id=f"TS::{acc_code}::{yyyymm}",
+                            reason=f"예측 대비 {'상회' if float(r.get('error',0))>0 else '하회'}: z={float(r.get('z',0)):+.2f}",
+                            anomaly_score=float(a),
+                            financial_impact=abs(float(r.get('amount', 0.0))),
+                            risk_score=float(r.get('risk', score)),
+                            is_key_item=bool(abs(float(r.get('amount',0.0))) >= pm_cur),
+                            measure="flow",
+                            sign_rule="assets/expenses↑=+, liabilities/equity↑=-",
+                            impacted_assertions=sorted({ "A", str(r.get('assertion','A')) }),
+                            links={"account_code": str(acc_code), "account_name": str(acc_name), "period_tag": "CY"}
+                        )
+
+                    # 2) EvidenceDetail 리스트 생성
+                    ts_evidences = run_timeseries_module(
+                        ts_monthly[['account','date','amount']],
+                        evidence_adapter=_ts_adapter,
+                    )
+
+                    ts_mod = ModuleResult(
+                        name="timeseries",
+                        summary={"n_rows": len(ts_monthly), "n_evidences": len(ts_evidences)},
+                        tables={},
+                        figures={},
+                        evidences=ts_evidences,
+                        warnings=[]
+                    )
+
+                    # 3) 위험 매트릭스: 이상치 + 예측 Evidence 동시 반영
+                    mat, emap = build_matrix([amod_full, ts_mod])
+                    if mat.empty:
+                        st.info("위험 매트릭스를 생성할 Evidence가 없습니다.")
+                    else:
+                        import plotly.express as px
+                        fig = px.imshow(mat, aspect='auto', origin='upper',
+                                        title="계정 × 주장 위험 히트맵 (max risk_score, 0~1)",
+                                        labels=dict(x="Assertion", y="Account", color="Risk"))
+                        fig.update_coloraxes(cmin=0, cmax=1)
+                        st.plotly_chart(fig, use_container_width=True)
+                        with st.expander("수치 테이블 보기", expanded=False):
+                            st.dataframe(mat, use_container_width=True)
+                        # 🔽 전체 Evidence CSV 내보내기 (행렬 근거 전부)
+                        from dataclasses import asdict
+                        all_evs = (amod_full.evidences or []) + (ts_mod.evidences or [])
+                        if all_evs:
+                            ev_all_df = pd.DataFrame([asdict(e) for e in all_evs])
+                            # impacted_assertions 리스트 문자열화
+                            if 'impacted_assertions' in ev_all_df.columns:
+                                ev_all_df['impacted_assertions'] = ev_all_df['impacted_assertions'].apply(
+                                    lambda xs: ",".join(xs) if isinstance(xs, list) else str(xs)
+                                )
+                            # links 평탄화
+                            if 'links' in ev_all_df.columns:
+                                _lnk = pd.json_normalize(ev_all_df['links']).add_prefix('links.')
+                                ev_all_df = pd.concat([ev_all_df.drop(columns=['links']), _lnk], axis=1)
+                            # 컬럼 순서 고정
+                            _ORDER = ['row_id','risk_score','anomaly_score','financial_impact','is_key_item',
+                                      'impacted_assertions','links.account_code','links.account_name','links.period_tag','reason']
+                            for col in _ORDER:
+                                if col not in ev_all_df.columns:
+                                    ev_all_df[col] = ""
+                            ev_all_df = ev_all_df[_ORDER]
+                            st.download_button(
+                                "📥 Evidence 전체 CSV 다운로드",
+                                ev_all_df.to_csv(index=False).encode('utf-8-sig'),
+                                file_name="evidence_all.csv",
+                                mime="text/csv"
+                            )
+
+                        # 드릴다운: 계정/주장 선택 → 근거 표시
+                        st.subheader("🔎 드릴다운: 특정 셀의 근거(Evidence)")
+                        acct = st.selectbox("계정(행)", ["선택하세요..."] + mat.index.tolist(), index=0, help="조사할 계정(행)을 선택하세요.", key="risk_dd_account")
+                        asrt = st.selectbox("주장(열)", ["선택하세요..."] + list(mat.columns), index=0, help="관리자의 주장(CEAVOP) 중에서 선택하세요.", key="risk_dd_assertion")
+                        # 선택한 주장에 대한 짧은 설명
+                        _asrt_help = {
+                            "C":"완전성", "E":"존재", "A":"정확성", "V":"평가·배분",
+                            "O":"발생", "P":"표시·공시"
+                        }
+                        if asrt in _asrt_help:
+                            st.caption(f"선택한 주장 설명: **{asrt} – {_asrt_help[asrt]}**")
+                        if acct != "선택하세요..." and asrt != "선택하세요...":
+                            from dataclasses import asdict
+                            ev_all = st.session_state.get('amod_full_evidences') or amod_full.evidences
+                            st.session_state['amod_full_evidences'] = ev_all
+                            def _match_ev(e, acct_name, asrt_code):
+                                name_ok = (e.links.get("account_name") == acct_name) or (e.links.get("account_code") == acct_name)
+                                asrt_ok = asrt_code in (e.impacted_assertions or [])
+                                return bool(name_ok and asrt_ok)
+                            direct_hits = [asdict(e) for e in ev_all if _match_ev(e, acct, asrt)]
+                            row_ids = emap.get((acct, asrt), [])
+                            by_id_hits = [asdict(e) for e in ev_all if str(e.row_id) in row_ids]
+                            rows = direct_hits or by_id_hits
+                            ev_df = pd.DataFrame(rows)
+                            if not ev_df.empty:
+                                ev_df['impacted_assertions'] = ev_df['impacted_assertions'].apply(lambda xs: ",".join(xs) if isinstance(xs, list) else str(xs))
+                                show_cols = ['row_id','risk_score','is_key_item','anomaly_score','financial_impact','impacted_assertions','reason']
+                                st.dataframe(ev_df[show_cols].sort_values('risk_score', ascending=False), use_container_width=True)
+                            else:
+                                st.info("해당 셀에서 표시할 Evidence 레코드를 찾지 못했습니다. (키 미스매치 방지 로직 적용 완료)")
+
+                        # 예측 Evidence 요약(듀얼 기준 + MoR)
+                        with st.expander("🔮 예측 기반 Evidence(요약) — 계정별 마지막 포인트", expanded=False):
+                            def _acc_label(k: str) -> str:
+                                return (k.split('|',1)[1] if '|' in str(k) else str(k))
+                            # 계정별 월 집계
+                            base = ts_monthly[['account','date','amount']].copy()
+                            base = base.rename(columns={'amount':'flow'})
+                            base['balance'] = base.groupby('account')['flow'].cumsum()
+                            # BS/PL 매핑
+                            bs_map = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
+                            bs_map['key'] = bs_map['계정코드'].astype(str) + '|' + bs_map['계정명'].astype(str)
+                            bs_flag = bs_map.set_index('key')['BS/PL'].map(lambda x: str(x).upper()=='BS').to_dict()
+                            from analysis.timeseries import run_timeseries_for_account
+                            rows_ts = []
+                            for acc, g in base.groupby('account'):
+                                is_bs = bool(bs_flag.get(str(acc), True))  # 정보없으면 True로 보수적 처리
+                                out = run_timeseries_for_account(
+                                    g[['date','flow','balance']], _acc_label(str(acc)),
+                                    is_bs=is_bs, flow_col='flow', balance_col='balance',
+                                    pm_value=float(st.session_state.get("pm_value", PM_DEFAULT))
+                                )
+                                if not out.empty:
+                                    rows_ts.append(out)
+                            # 보기 범위 토글은 항상 노출
+                            scope = st.selectbox("보기 범위", options=["flow","balance","both"], index=2, key="ts_scope_main")
+                            if rows_ts:
+                                df_ts = pd.concat(rows_ts, ignore_index=True)
+                                st.caption("BS 계정은 잔액·발생액 기준을 병행 계산합니다. 표시 기준은 위 토글을 따릅니다.")
+                                st.caption("본 예측은 **PY+CY 연속 월**(보간 없음)로 학습하고 MoR(최적 모델)을 사용합니다. error는 z와 함께 해석하세요.")
+                                df_view = df_ts if scope == "both" else df_ts[df_ts['measure'] == scope]
+                                st.dataframe(df_view[['date','account','measure','actual','predicted','error','z','risk','model']], use_container_width=True)
+
+                                # === (교체) 계정/기준 선택 라인/쌍차트 ===
+                                import plotly.graph_objects as go
+
+                                def _make_ts_fig(df_hist: pd.DataFrame, measure: str, title: str):
+                                    """EMA 기반 예측선을 같이 그려주는 간단 라인차트(실선=actual, 점선=pred)."""
+                                    s = df_hist[['date', measure]].rename(columns={measure: 'actual'}).sort_values('date').copy()
+                                    if s.empty:
+                                        return None
+                                    # EMA 예측선(shift 1)
+                                    s['predicted'] = s['actual'].ewm(span=6, adjust=False).mean().shift(1)
+                                    fig = go.Figure()
+                                    fig.add_trace(go.Scatter(x=s['date'], y=s['actual'], mode='lines', name='actual'))
+                                    fig.add_trace(go.Scatter(x=s['date'], y=s['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
+                                    fig.update_layout(title=title, xaxis_title='month', yaxis_title=measure)
+                                    try:
+                                        return add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
+                                    except Exception:
+                                        return fig
+
+                                # ── 선택 계정
+                                sel_acc = st.selectbox("계정 선택", sorted(df_ts["account"].unique()), key="ts_plot_acc")
+
+                                # 히스토리(월별 flow/balance 재구성)
+                                hist_base = use_ts.copy()  # use_ts는 위에서 만든 monthly agg (account,date,amount)
+                                # 계정별로 flow/balance 동시 구성
+                                hist_base = hist_base.rename(columns={'amount':'flow'})
+                                hist_base['balance'] = hist_base.sort_values('date').groupby('account')['flow'].cumsum()
+
+                                cur_hist = hist_base[hist_base['account'] == sel_acc].copy()
+                                if cur_hist.empty:
+                                    st.info("선택 계정의 월별 데이터가 없습니다.")
+                                else:
+                                    # BS 여부 판단 (Master의 BS/PL 활용)
+                                    _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
+                                    # 계정명이 같은 항목을 찾아 BS/PL 확인 (없으면 PL 취급)
+                                    try:
+                                        is_bs = bool(_mdf[_mdf['계정명'] == sel_acc]['BS/PL'].astype(str).str.upper().eq('BS').any())
+                                    except Exception:
+                                        is_bs = False
+
+                                    pair = st.toggle("쌍차트 보기(Flow+Balance)", value=is_bs, disabled=not is_bs)
+                                    if pair and is_bs:
+                                        c1, c2 = st.columns(2)
+                                        with c1:
+                                            f1 = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                            if f1: st.plotly_chart(f1, use_container_width=True)
+                                        with c2:
+                                            f2 = _make_ts_fig(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
+                                            if f2: st.plotly_chart(f2, use_container_width=True)
+                                    else:
+                                        measure = st.radio("기준(Measure)", ["flow","balance"], horizontal=True, index=0 if not is_bs else 0,
+                                                           help="BS가 아닌 계정은 balance가 의미 없을 수 있습니다.")
+                                        fig = _make_ts_fig(cur_hist, measure, f"{sel_acc} — {measure.title()} (actual vs MoR)")
+                                        if fig: st.plotly_chart(fig, use_container_width=True)
+
+                                # CSV 내보내기(항상 두 기준 포함)
+                                st.download_button(
+                                    "📥 예측 요약 CSV 다운로드(듀얼기준)",
+                                    data=df_ts.to_csv(index=False).encode('utf-8-sig'),
+                                    file_name="evidence_timeseries_dual.csv",
+                                    mime="text/csv",
+                                    key="ts_csv_dl"
+                                )
+                            else:
+                                st.info("최근 포인트 기준 예측 이탈 Evidence가 없습니다.")
+
+                        # (중복) 드릴다운 블럭 제거 — 위에 이미 1회 존재
+
+                with tab6:
+                    st.header("AI 리포트 및 채팅")
+                    # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능
+                    LLM_OK = False
+                    try:
+                        from services.llm import openai_available
+                        LLM_OK = bool(openai_available())
+                    except Exception:
+                        LLM_OK = False
+                    if not LLM_OK:
+                        st.info("🔌 OpenAI Key 없음: 오프라인 리포트 모드로 생성합니다. (클러스터/요약 LLM 미사용)")
+                    rendered_report = False
+
+                    # === 모델/토큰 옵션 UI ===
+                    colm1, colm2, colm3 = st.columns([1,1,1])
+                    with colm1:
+                        llm_model_choice = st.selectbox(
+                            "LLM 모델", options=["gpt-5", "gpt-4o"], index=1,
+                            help="gpt-5 미가용 시 자동으로 gpt-4o로 대체하세요(코드에서 예외 처리)."
+                        )
+                    with colm2:
+                        desired_tokens = st.number_input(
+                            "보고서 최대 출력 토큰", min_value=512, max_value=32000, value=16000, step=512,
+                            help="실제 전송값은 모델 컨텍스트와 입력 토큰을 고려해 안전 클램프됩니다."
+                        )
+                    with colm3:
+                        st.caption("금액·포맷은 코드에서 강제됩니다.")
+
+                    # --- 입력 영역 ---
+                    mdf = st.session_state.master_df
+                    ldf = st.session_state.ledger_df
+
+                    # ① 계정 선택(필수) — 자동 추천 제거
+                    acct_names_all = sorted(mdf['계정명'].dropna().unique().tolist())
+                    pick_accounts = st.multiselect(
+                        "보고서 대상 계정(들)을 선택하세요. (최소 1개)",
+                        options=acct_names_all,
+                        default=[]
+                    )
+                    # ② 옵션 제거: 항상 수행 플래그
+                    opt_knn_evidence = True
+                    opt_patterns = True
+                    opt_patterns_py = True
+
+                    # ③ 사용자 메모(선택)
+                    manual_ctx = st.text_area(
+                        "보고서에 추가할 메모/주의사항(선택)",
+                        placeholder="예: 5~7월 대형 캠페인 집행 영향, 3분기부터 단가 인상 예정 등"
+                    )
+
+                    # ④ 선택 계정코드 매핑
+                    pick_codes = (
+                        mdf[mdf['계정명'].isin(pick_accounts)]['계정코드']
+                        .astype(str).tolist()
+                    )
+
+                    colA, colB, colC = st.columns([1,1,1])
+                    with colA: st.write("선택 계정코드:", ", ".join(pick_codes) if pick_codes else "-")
+                    with colB: st.write("기준 연도(CY):", int(ldf['연도'].max()))
+                    with colC: st.write("보고서 기준:", "Current Year GL")
+
+                    # 버튼은 계정 미선택 시 비활성화
+                    btn = st.button("📝 보고서 생성", type="primary", disabled=(len(pick_codes) == 0))
+                    if len(pick_codes) == 0:
+                        st.info("계정 1개 이상 선택 시 버튼이 활성화됩니다.")
+
+                    if btn:
+                        import time
+                        from analysis.anomaly import compute_amount_columns
+                        from analysis.embedding import ensure_rich_embedding_text, perform_embedding_and_clustering
+                        from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note, run_offline_fallback_report
+                        from services.llm import LLMClient
+                        from analysis.anomaly import ensure_zscore
+
+                        t0 = time.perf_counter()
+                        with st.status("보고서 준비 중...", expanded=True) as s:
+                            # Step 1) 데이터 슬라이싱
+                            s.write("① 스코프 적용 및 데이터 슬라이싱(CY/PY)…")
+                            cur_year = ldf['연도'].max()
+                            df_cy = ldf[(ldf['period_tag'] == 'CY') & (ldf['계정코드'].astype(str).isin(pick_codes))].copy()
+                            df_py = ldf[(ldf['period_tag'] == 'PY') & (ldf['계정코드'].astype(str).isin(pick_codes))].copy()
+                            s.write(f"    └ CY {len(df_cy):,}건 / PY {len(df_py):,}건")
+
+                            # Step 2) 필수 파생(발생액/순액)
+                            s.write("② 금액 파생 컬럼 생성(발생액/순액)…")
+                            df_cy = compute_amount_columns(df_cy)
+                            df_py = compute_amount_columns(df_py)
+
+                            # Step 3) (선택) 패턴요약: 임베딩/클러스터링 (LLM 사용 가능 시에만)
+                            cl_ok = False
+                            if LLM_OK and opt_patterns and not df_cy.empty:
+                                s.write("③ 임베딩·클러스터링 실행(선택)…")
+                                # 입력 텍스트 풍부화 + 임베딩 + HDBSCAN (최대 N 제한으로 안전가드)
+                                df_cy_small = df_cy.copy()
+                                max_rows = 8000
+                                if len(df_cy_small) > max_rows:
+                                    df_cy_small = df_cy_small.sample(max_rows, random_state=42)
+                                    s.write(f"    └ 데이터가 많아 {max_rows:,}건으로 샘플링")
+                                df_cy_small = ensure_rich_embedding_text(df_cy_small)
+                                try:
+                                    emb_client = LLMClient().client  # OpenAI 클라이언트 객체
+                                    # LLM naming is mandatory for the report
+                                    df_clu, ok = perform_embedding_and_clustering(
+                                        df_cy_small, emb_client,
+                                        name_with_llm=True, must_name_with_llm=True,
+                                        use_large=bool(st.session_state.get("use_large_embedding", False)),
+                                        rescue_tau=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
+                                    )
+                                    if ok:
+                                        # unify near-duplicate names using LLM
+                                        from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
+                                        df_clu, name_map = unify_cluster_names_with_llm(df_clu, emb_client)
+                                        # 추가 LLM 라벨 통합(JSON 매핑 방식) — CY의 cluster_group은 유지
+                                        try:
+                                            raw_map = unify_cluster_labels_llm(df_clu['cluster_name'].dropna().unique().tolist(), emb_client)
+                                            if raw_map:
+                                                df_clu['cluster_name'] = df_clu['cluster_name'].map(lambda x: raw_map.get(str(x), x))
+                                                # ❗ cluster_group는 unify_cluster_names_with_llm()이 정한 canonical을 유지
+                                        except Exception:
+                                            pass
+                                        # 간단 요약(상위 5개)
+                                        topc = (df_clu.groupby('cluster_group')['발생액']
+                                                .agg(['count','sum']).sort_values('sum', ascending=False).head(5))
+                                        s.write("    └ 클러스터 상위 5개 요약:")
+                                        st.dataframe(
+                                            topc.rename(columns={'count':'건수','sum':'발생액합계'})
+                                                .style.format({'발생액합계':'{:,.0f}'}),
+                                            use_container_width=True
+                                        )
+                                        # Quality telemetry
+                                        try:
+                                            n = int(len(df_clu))
+                                            noise_rate = float((df_clu['cluster_id'] == -1).mean()) if n else 0.0
+                                            n_clusters = int(df_clu.loc[df_clu['cluster_id'] != -1, 'cluster_id'].nunique())
+                                            if n_clusters > 0:
+                                                avg_size = float(df_clu[df_clu['cluster_id'] != -1].groupby('cluster_id').size().mean())
+                                            else:
+                                                avg_size = 0.0
+                                            rescue_rate = float(df_clu.get('rescued', False).mean()) if 'rescued' in df_clu.columns else 0.0
+                                            model_used = df_clu.attrs.get('embedding_model', 'unknown')
+                                            umap_on = bool(df_clu.attrs.get('umap_used', False))
+                                            s.write(
+                                                f"    └ Quality: N={n:,}, noise={noise_rate*100:.1f}%, "
+                                                f"clusters={n_clusters}, avg_size={avg_size:.1f}, rescued={rescue_rate*100:.1f}%"
+                                            )
+                                            s.write(
+                                                f"    └ Model/UMAP: {model_used} | UMAP={'on' if umap_on else 'off'} | τ={float(st.session_state.get('rescue_tau', HDBSCAN_RESCUE_TAU)):.2f}"
+                                            )
+                                            # Persist metrics for dashboard card
+                                            st.session_state['cluster_quality'] = {
+                                                "N": n,
+                                                "noise_rate": noise_rate,
+                                                "n_clusters": n_clusters,
+                                                "avg_size": avg_size,
+                                                "rescued_rate": rescue_rate,
+                                                "model": model_used,
+                                                "umap": umap_on,
+                                                "tau": float(st.session_state.get('rescue_tau', HDBSCAN_RESCUE_TAU)),
+                                            }
+                                        except Exception:
+                                            pass
+                                        # 보고서 컨텍스트에 반영: group/label 동시 부착
+                                        df_cy = df_cy.merge(
+                                            df_clu[['row_id','cluster_id','cluster_name','cluster_group']],
+                                            on='row_id', how='left'
+                                        )
+                                        # 필요 시 vector도 함께 병합 가능:
+                                        # df_cy = df_cy.merge(df_clu[['row_id','vector']], on='row_id', how='left')
+                                        # (현재는 perform_embedding_only 단계에서 CY/PY df에 vector가 직접 부여됨)
+                                        # --- PY clustering and alignment (optional) ---
+                                        if opt_patterns_py and not df_py.empty:
+                                            try:
+                                                from analysis.embedding import cluster_year, align_yearly_clusters, unify_cluster_labels_llm
+                                                # sampling guard similar to CY
+                                                df_py_small = df_py.copy()
+                                                max_rows = 8000
+                                                if len(df_py_small) > max_rows:
+                                                    df_py_small = df_py_small.sample(max_rows, random_state=42)
+                                                    s.write(f"    └ PY 데이터가 많아 {max_rows:,}건으로 샘플링")
+                                                df_py_clu = cluster_year(df_py_small, emb_client)
+                                                # push back columns to df_py via row_id if available
+                                                if not df_py_clu.empty and 'row_id' in df_py.columns:
+                                                    df_py = df_py.merge(df_py_clu, on='row_id', how='left', suffixes=("", "_pyclu"))
+                                                # alignment: map PY cluster IDs to CY
+                                                if 'cluster_id' in df_py_clu.columns:
+                                                    mapping = align_yearly_clusters(df_clu, df_py_clu, sim_threshold=0.70)
+                                                    # cluster_id → (aligned_cy_cluster, aligned_sim)
+                                                    cy_id_to_name = df_clu.drop_duplicates('cluster_id').set_index('cluster_id')['cluster_name'].to_dict()
+                                                    def _get_pair(cid):
+                                                        try:
+                                                            if pd.isna(cid):
+                                                                return (np.nan, np.nan)
+                                                            cid_int = int(cid)
+                                                            return mapping.get(cid_int, (np.nan, np.nan))
+                                                        except Exception:
+                                                            return (np.nan, np.nan)
+                                                    if 'cluster_id' in df_py.columns:
+                                                        pairs = df_py['cluster_id'].map(_get_pair)
+                                                        df_py[['aligned_cy_cluster', 'aligned_sim']] = pd.DataFrame(pairs.tolist(), index=df_py.index)
+                                                        # 이름은 CY의 이름으로 정렬(가능한 경우)
+                                                        df_py['cluster_name'] = df_py['aligned_cy_cluster'].map(cy_id_to_name).fillna(df_py.get('cluster_name'))
+                                                # final unification over union of names — CY의 cluster_group 불변, PY는 표시명/그룹을 canonical로 정렬
+                                                try:
+                                                    all_names = pd.Series([], dtype=object)
+                                                    if 'cluster_name' in df_cy.columns:
+                                                        all_names = pd.concat([all_names, df_cy['cluster_name'].dropna().astype(str)], ignore_index=True)
+                                                    if 'cluster_name' in df_py.columns:
+                                                        all_names = pd.concat([all_names, df_py['cluster_name'].dropna().astype(str)], ignore_index=True)
+                                                    all_names = all_names.dropna().unique().tolist()
+                                                    canon = unify_cluster_labels_llm(all_names, emb_client)
+                                                    if canon:
+                                                        if 'cluster_name' in df_cy.columns:
+                                                            df_cy['cluster_name'] = df_cy['cluster_name'].map(lambda x: canon.get(str(x), x))
+                                                        if 'cluster_name' in df_py.columns:
+                                                            df_py['cluster_name'] = df_py['cluster_name'].map(lambda x: canon.get(str(x), x))
+                                                        if 'cluster_group' in df_py.columns:
+                                                            df_py['cluster_group'] = df_py['cluster_name']
+                                                except Exception:
+                                                    pass
+                                            except Exception as e:
+                                                s.write(f"    └ PY 클러스터링/정렬 스킵: {e}")
+                                        # 컨텍스트에 별도 노트는 추가하지 않음
+                                        cl_ok = True
+                                    else:
+                                        s.write("    └ LLM 클러스터 이름 생성 실패 또는 결과 없음 → 보고서 생성 요건 미충족")
+                                except Exception as e:
+                                    s.write(f"    └ 임베딩/클러스터링 실패: {e}")
+                            else:
+                                s.write("③ 임베딩·클러스터링: LLM 미가용 또는 옵션 비활성 → 스킵")
+
+                            # Step 3-1) (옵션 A) 근거 인용(KNN)용 임베딩만 수행 (LLM 가능 시)
+                            if LLM_OK and opt_knn_evidence:
+                                s.write("③-1 근거 인용용 임베딩(CY/PY)…")
+                                from analysis.embedding import perform_embedding_only, ensure_rich_embedding_text
+                                emb_client2 = LLMClient().client
+                                df_cy = ensure_rich_embedding_text(df_cy)
+                                df_py = ensure_rich_embedding_text(df_py)
+                                df_cy = perform_embedding_only(
+                                    df_cy, client=emb_client2,
+                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                )
+                                df_py = perform_embedding_only(
+                                    df_py, client=emb_client2,
+                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                )
+                            elif not LLM_OK:
+                                s.write("③-1 근거 인용 임베딩: LLM 미가용 → 스킵")
+
+                            # Step 3-2) Z-Score: 반드시 존재해야 함
+                            s.write("③-2 Z-Score 계산/검증…")
+                            df_cy, z_ok = ensure_zscore(df_cy, pick_codes)
+                            df_py, _    = ensure_zscore(df_py, pick_codes)  # 전기에도 Z-Score 계산(컨텍스트에서 사용)
+                            if not z_ok:
+                                s.write("    └ Z-Score 미계산 또는 전부 결측")
+
+                            # ✅ 게이트 완화: Z-Score만 확보되면 보고서 진행.
+                            #    (클러스터 실패 시 관련 섹션은 자동 축약/생략)
+                            if not z_ok:
+                                st.error("보고서 생성 중단: Z-Score 없음.")
+                                s.update(label="보고서 요건 미충족", state="error")
+                                st.stop()
+                            if not cl_ok:
+                                s.write("    └ 클러스터링 결과 없음 → 리포트에서 클러스터 섹션은 생략/축약됩니다.")
+
+                            # Step 4) 컨텍스트 생성 + 방법론 노트
+                            s.write("④ 컨텍스트 텍스트 구성…")
+                            ctx = generate_rag_context(
+                                mdf, df_cy, df_py,
+                                account_codes=pick_codes,
+                                manual_context=manual_ctx,
+                                include_risk_summary=True,
+                                pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
+                            )
+                            note = build_methodology_note(report_accounts=pick_codes)
+
+                            # Step 5) LLM 호출 전 점검(길이/토큰)
+                            s.write("⑤ LLM 프롬프트 점검…")
+                            prompt_len = len(ctx) + len(note)
+                            s.write(f"    └ 컨텍스트 길이: {prompt_len:,} chars")
+                            try:
+                                import tiktoken
+                                enc = tiktoken.get_encoding("cl100k_base")
+                                est_tokens = len(enc.encode(ctx)) + len(enc.encode(note))
+                                s.write(f"    └ 예상 토큰 수: ~{est_tokens:,} tokens")
+                            except Exception:
+                                s.write("    └ tiktoken 미설치: 토큰 추정 생략")
+
+                            # Step 6) 보고서 생성: LLM 가능하면 시도, 실패/불가 시 오프라인 폴백
+                            final_report = None
+                            if LLM_OK:
+                                s.write("⑥ LLM 요약 생성 호출…")
+                                try:
+                                    t_llm0 = time.perf_counter()
+                                    final_report = run_final_analysis(
+                                        context=ctx + "\n" + note,
+                                        account_codes=pick_codes,
+                                        model=llm_model_choice,
+                                        max_tokens=int(desired_tokens),
+                                    )
+                                    s.write(f"    └ LLM 완료 (경과 {time.perf_counter()-t_llm0:.1f}s)")
+                                except Exception as e:
+                                    s.write(f"    └ LLM 실패: {e} → 오프라인 폴백으로 전환")
+
+                            if final_report is None:
+                                s.write("⑥-폴백: 오프라인 리포트 생성…")
+                                final_report = run_offline_fallback_report(
+                                    current_df=df_cy,
+                                    previous_df=df_py,
+                                    account_codes=pick_codes,
+                                    pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
+                                )
+
+                            s.update(label="보고서 준비 완료", state="complete")
+
+                            # 결과 출력 및 세션 보존
+                            st.session_state['last_report'] = final_report
+                            st.session_state['last_context'] = ctx + "\n" + note
+                            st.session_state['last_dfcy'] = df_cy
+                            st.session_state['last_dfpy'] = df_py
+
+                            st.success("보고서가 생성되었습니다.")
+                            st.markdown("### 📄 AI 요약 보고서")
+                            st.markdown(final_report)
+
+                        with st.expander("🔎 근거 컨텍스트(LLM 입력)", expanded=False):
+                            st.text(st.session_state['last_context'])
+
+                        # ZIP 단일 다운로드 + RAW 미리보기
+                        import io, zipfile
+                        def _build_raw_evidence(df_cy_in):
+                            keep = [c for c in ['회계일자','계정코드','계정명','거래처','적요','발생액','순액','Z-Score','cluster_group','cluster_name'] if c in df_cy_in.columns]
+                            return df_cy_in[keep].copy() if keep else pd.DataFrame()
+                        def _make_zip_blob(report_txt: str, context_txt: str, raw_df: pd.DataFrame) -> bytes:
+                            mem = io.BytesIO()
+                            with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+                                z.writestr('report.txt', report_txt)
+                                z.writestr('context.txt', context_txt)
+                                z.writestr('evidence_raw.csv', raw_df.to_csv(index=False, encoding='utf-8-sig'))
+                            mem.seek(0)
+                            return mem.getvalue()
+
+                        raw_df = _build_raw_evidence(st.session_state['last_dfcy'])
+                        st.markdown("#### 📑 근거: 선택 계정 원장(RAW) + 클러스터")
+                        if not raw_df.empty:
+                            st.dataframe(
+                                raw_df.head(100).style.format({'발생액':'{:,.0f}','순액':'{:,.0f}','Z-Score':'{:.2f}'}),
+                                use_container_width=True, height=350
+                            )
+                        else:
+                            st.info("표시할 RAW가 없습니다.")
+
+                        zip_bytes = _make_zip_blob(
+                            report_txt=st.session_state['last_report'],
+                            context_txt=st.session_state['last_context'],
+                            raw_df=raw_df
+                        )
+                        st.download_button(
+                            "📥 보고서+근거 다운로드(ZIP)",
+                            data=zip_bytes,
+                            file_name="ai_report_with_evidence.zip",
+                            mime="application/zip",
+                            key="zip_dl_current"  # 고유 키(현재 결과)
+                        )
+
+                        st.caption(f"⏱ 총 소요: {time.perf_counter()-t0:.1f}s")
+                        rendered_report = True
+
+                    # === 캐시된 이전 결과 렌더(버튼 미클릭 시에만) ===
+                    if st.session_state.get('last_report') and not btn:
+                        st.success("보고서가 준비되어 있습니다.")
+                        st.markdown("### 📄 AI 요약 보고서")
+                        st.markdown(st.session_state['last_report'])
+                        with st.expander("🔎 근거 컨텍스트(LLM 입력)", expanded=False):
+                            st.text(st.session_state['last_context'])
+                        # RAW 미리보기 + ZIP 버튼 재출력
+                        import io, zipfile
+                        def _build_raw_evidence(df_cy_in):
+                            keep = [c for c in ['회계일자','계정코드','계정명','거래처','적요','발생액','순액','Z-Score','cluster_group','cluster_name'] if c in df_cy_in.columns]
+                            return df_cy_in[keep].copy() if keep else pd.DataFrame()
+                        def _make_zip_blob(report_txt: str, context_txt: str, raw_df: pd.DataFrame) -> bytes:
+                            mem = io.BytesIO()
+                            with zipfile.ZipFile(mem, 'w', zipfile.ZIP_DEFLATED) as z:
+                                z.writestr('report.txt', report_txt)
+                                z.writestr('context.txt', context_txt)
+                                z.writestr('evidence_raw.csv', raw_df.to_csv(index=False, encoding='utf-8-sig'))
+                            mem.seek(0)
+                            return mem.getvalue()
+                        raw_df = _build_raw_evidence(st.session_state.get('last_dfcy', pd.DataFrame()))
+                        st.markdown("#### 📑 근거: 선택 계정 원장(RAW) + 클러스터")
+                        if not raw_df.empty:
+                            st.dataframe(
+                                raw_df.head(100).style.format({'발생액':'{:,.0f}','순액':'{:,.0f}','Z-Score':'{:.2f}'}),
+                                use_container_width=True, height=350
+                            )
+                        else:
+                            st.info("표시할 RAW가 없습니다.")
+                        zip_bytes = _make_zip_blob(
+                            report_txt=st.session_state['last_report'],
+                            context_txt=st.session_state['last_context'],
+                            raw_df=raw_df
+                        )
+                        st.download_button(
+                            "📥 보고서+근거 다운로드(ZIP)",
+                            data=zip_bytes,
+                            file_name="ai_report_with_evidence.zip",
+                            mime="application/zip",
+                            key="zip_dl_cached"  # 고유 키(캐시 결과)
+                        )
+                        # Cluster quality card (if available)
+                        cq = st.session_state.get("cluster_quality")
+                        if cq:
+                            st.markdown("---")
+                            st.subheader("클러스터 품질 요약")
+                            c1, c2, c3, c4 = st.columns(4)
+                            c1.metric("Noise rate", f"{cq['noise_rate']*100:.1f}%")
+                            c2.metric("#Clusters", f"{cq['n_clusters']}")
+                            c3.metric("Avg size", f"{cq['avg_size']:.1f}")
+                            c4.metric("Rescued", f"{cq['rescued_rate']*100:.1f}%")
+                            st.caption(f"Model: {cq['model']} | UMAP: {'on' if cq['umap'] else 'off'} | τ={cq['tau']:.2f} | N={cq['N']:,}")
+        except Exception as e:
+            st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
+            if st.button("매핑 단계로 돌아가기"):
+                st.session_state.mapping_confirmed = False
+                st.rerun()
+else:
+    st.info("⬅️ 왼쪽 사이드바에서 분석할 엑셀 파일을 업로드해주세요.")
+
+
