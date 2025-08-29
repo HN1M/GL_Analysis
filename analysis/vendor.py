@@ -5,6 +5,7 @@ from plotly.subplots import make_subplots
 import plotly.graph_objects as go
 from itertools import product
 from analysis.contracts import LedgerFrame, ModuleResult
+from utils.viz import add_materiality_threshold, add_pm_badge
 
 
 def create_pareto_figure(ledger_df: pd.DataFrame, min_amount: float = 0, include_others: bool = True):
@@ -147,6 +148,13 @@ def run_vendor_module(lf: LedgerFrame, account_codes: List[str] | None = None,
 
     pareto = create_pareto_figure(use_df, min_amount=min_amount, include_others=include_others)
     heatmap = create_vendor_heatmap(use_df, min_amount=min_amount, include_others=include_others)
+
+    # PM 보조선/배지 적용
+    pm_value = (lf.meta or {}).get("pm_value")
+    if pareto and pm_value:
+        add_materiality_threshold(pareto, pm_value=pm_value)
+    if heatmap and pm_value:
+        add_pm_badge(heatmap, pm_value=pm_value)
 
     if pareto: figures['pareto'] = pareto
     else: warnings.append("Pareto 그래프 생성 불가(데이터 부족).")

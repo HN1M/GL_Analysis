@@ -2,6 +2,8 @@ import pandas as pd
 import plotly.express as px
 from typing import List, Dict, Any
 from analysis.contracts import LedgerFrame, ModuleResult
+from utils.viz import add_materiality_threshold
+from utils.helpers import is_credit_account
 
 
 def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame, account_code: str, account_name: str):
@@ -10,31 +12,45 @@ def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame
     if mrow.empty:
         return None  # 안전 가드
     master_row = mrow.iloc[0]
-    bspl = master_row.get('BS/PL', 'PL').upper()
-    nature = master_row.get('차변/대변', '차변').strip()
-    sign = -1.0 if '대변' in nature else 1.0
+    bspl = str(master_row.get('BS/PL', 'PL') or 'PL').upper()
+    dc = master_row.get('차변/대변', None)
+    # 대변 성격이면 그래프 부호를 뒤집어 시각화
+    sign = -1.0 if is_credit_account(bspl, dc) else 1.0
 
-    current_year = ledger_df['연도'].max()
+    if '연도' not in ledger_df.columns or ledger_df['연도'].isna().all():
+        return None
+    current_year = int(ledger_df['연도'].max())
     df_filtered = ledger_df[(ledger_df['계정코드'] == account_code) & (ledger_df['연도'].isin([current_year, current_year - 1]))]
     months = list(range(1, 13))
     plot_df_list = []
 
     if bspl == 'BS':
-        bop_cy = master_row.get('전기말잔액', 0)
-        bop_py = master_row.get('전전기말잔액', 0)
+        def _f(x):
+            try:
+                v = float(x)
+                return 0.0 if pd.isna(v) else v
+            except Exception:
+                return 0.0
+        bop_cy = _f(master_row.get('전기말잔액', 0))
+        bop_py = _f(master_row.get('전전기말잔액', 0))
         for year, bop, year_label in [(current_year, bop_cy, 'CY'), (current_year - 1, bop_py, 'PY')]:
-            monthly_flow = df_filtered[df_filtered['연도'] == year].groupby('월')['거래금액'].sum()
+            monthly_flow = df_filtered[df_filtered['연도'] == year].groupby('월')['거래금액'].sum() if '거래금액' in df_filtered.columns else pd.Series(dtype=float)
             monthly_series = pd.Series(index=months, data=0.0)
             monthly_series.update(monthly_flow)
             monthly_balance = bop + monthly_series.cumsum()
             plot_df_list.append(pd.DataFrame({'월': months, '금액': monthly_balance.values * sign, '구분': year_label}))
         title_suffix = "월별 잔액 추이 (BS)"
     else:
-        monthly_sum = df_filtered.groupby(['연도', '월'])['거래금액'].sum().reset_index()
+        # PL: 금액 컬럼 유연 인식
+        cand = ['거래금액', '발생액', '거래금액_절대값', 'amount', '금액']
+        amt_col = next((c for c in cand if c in df_filtered.columns), None)
+        if amt_col is None:
+            return None
+        monthly_sum = df_filtered.groupby(['연도', '월'])[amt_col].sum().reset_index()
         for year, year_label in [(current_year, 'CY'), (current_year - 1, 'PY')]:
             year_data = monthly_sum[monthly_sum['연도'] == year]
             monthly_series = pd.Series(index=months, data=0.0)
-            monthly_series.update(year_data.set_index('월')['거래금액'])
+            monthly_series.update(year_data.set_index('월')[amt_col])
             plot_df_list.append(pd.DataFrame({'월': months, '금액': monthly_series.values * sign, '구분': year_label}))
         title_suffix = "월별 발생액 추이 (PL)"
 
@@ -87,6 +103,7 @@ def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> Modu
     acc_codes = [str(a) for a in accounts]
     figures: Dict[str, Any] = {}
     warns: List[str] = []
+    pm_value = (lf.meta or {}).get("pm_value")
     for code in acc_codes:
         m = master_df[master_df['계정코드'].astype(str) == code]
         if m.empty:
@@ -95,6 +112,8 @@ def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> Modu
         name = m.iloc[0].get('계정명', str(code))
         fig = create_monthly_trend_figure(df, master_df, code, name)
         if fig:
+            if pm_value:
+                add_materiality_threshold(fig, pm_value=pm_value)
             figures[f"{code}:{name}"] = fig
         else:
             warns.append(f"{name}({code}) 그림 생성 불가(데이터 부족).")

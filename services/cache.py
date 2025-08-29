@@ -23,8 +23,29 @@ def _db_path(model: str) -> str:
     return str(_model_dir(model) / "embeddings.sqlite3")
 
 def _sha1(s: str) -> str:
-    # 보안용이 아닌 키 해싱(캐시 키용)
-    return hashlib.sha1(s.encode("utf-8"), usedforsecurity=False).hexdigest()
+    """
+    FIPS 모드에서도 동작하도록 안전 가드:
+    1) hashlib.sha1(..., usedforsecurity=False) 시도
+    2) 파라미터 미지원/차단 시 hashlib.sha1(b) 시도
+    3) 그래도 실패하면 hashlib.new("sha1") 시도
+    4) 최종 폴백: blake2s(20바이트) — 캐시 키 용도라 160-bit 길이만 유지되면 충분
+    """
+    b = s.encode("utf-8")
+    try:
+        return hashlib.sha1(b, usedforsecurity=False).hexdigest()  # type: ignore[call-arg]
+    except TypeError:
+        try:
+            return hashlib.sha1(b).hexdigest()
+        except Exception:
+            pass
+    except Exception:
+        pass
+    try:
+        h = hashlib.new("sha1", b)
+        return h.hexdigest()
+    except Exception:
+        # final fallback: 160-bit digest for key-length parity
+        return hashlib.blake2s(b, digest_size=20).hexdigest()
 
 def _get_lock(model: str) -> threading.Lock:
     if model not in _LOCKS:

@@ -72,6 +72,10 @@ def _boldify_bracket_headers(text: str) -> str:
     # [요약], [주요 거래], [결론], [용어 설명] → **[...]**\n
     text = re.sub(r'^\[(요약|주요 거래|결론|용어 설명)\]\s*', r'**[\1]**\n', text, flags=re.MULTILINE)
     return text
+def _strip_control(s: str) -> str:
+    # 탭/개행 제외 모든 제어문자 제거 (0x00-0x1F, 0x7F)
+    return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", s or "")
+
 
 # --- NEW: ModuleResult 기반 컨텍스트 (경량 버전) ---
 def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
@@ -104,7 +108,7 @@ def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: f
                         risk = float(getattr(e, "risk_score", 0.0))
                         kit  = bool(getattr(e, "is_key_item", False))
                         rsn  = str(getattr(e, "reason", ""))
-                        lines.append(f"  	4020• {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit} reason={rsn}")
+                        lines.append(_strip_control(f"  - {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit} reason={rsn}"))
                     except Exception:
                         continue
             tbls = getattr(m, "tables", None)
@@ -116,7 +120,7 @@ def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: f
                         pass
         except Exception:
             continue
-    return "\n".join(lines).strip()
+    return _strip_control("\n".join(lines)).strip()
 
 
 def _safe_load(s: str):
@@ -206,13 +210,24 @@ def build_timeseries_summary_block(current_df: pd.DataFrame, topn: int = 5) -> s
     if current_df is None or current_df.empty or '회계일자' not in current_df.columns:
         return "\n\n## 예측 이탈 요약\n- (데이터 없음)"
     df = current_df.copy()
+    # 날짜/계정 가드
+    try:
+        df['회계일자'] = pd.to_datetime(df['회계일자'], errors='coerce')
+    except Exception:
+        return "\n\n## 예측 이탈 요약\n- (날짜 형식 오류)"
     if '계정명' not in df.columns:
         return "\n\n## 예측 이탈 요약\n- (계정명이 필요합니다)"
     df['연월'] = df['회계일자'].dt.to_period('M')
-    m = (df.groupby(['계정명','연월'], as_index=False)['거래금액'].sum())
+    # 금액 컬럼 유연 인식
+    cand = ['거래금액', '발생액', '거래금액_절대값', 'amount', '금액']
+    val_col = next((c for c in cand if c in df.columns), None)
+    if not val_col:
+        return "\n\n## 예측 이탈 요약\n- (금액 컬럼을 찾지 못했습니다)"
+
+    m = (df.groupby(['계정명','연월'], as_index=False)[val_col].sum())
     m['account'] = m['계정명']
     m['date'] = m['연월'].dt.to_timestamp('M')
-    m['amount'] = m['거래금액']
+    m['amount'] = m[val_col]
 
     rows = run_timeseries_module(m[['account','date','amount']])
     if rows is None or rows.empty:
