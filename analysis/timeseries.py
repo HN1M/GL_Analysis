@@ -10,7 +10,8 @@ import pandas as pd
 try:
     from config import PM_DEFAULT as _PM_DEFAULT
 except Exception:
-    _PM_DEFAULT = 0.7
+    # 실운영 기본값: 5억 (사용자 입력 미제공 시 최후의 안전값)
+    _PM_DEFAULT = 500_000_000
 try:
     from config import FORECAST_MIN_POINTS as _FORECAST_MIN_POINTS
 except Exception:

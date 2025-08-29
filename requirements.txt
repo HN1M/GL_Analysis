@@ -17,3 +17,4 @@ umap-learn   # 고차원 데이터 임베딩 시각화 및 차원 축소
 statsmodels  # ARIMA 시계열 모델
 prophet      # 시계열 예측 모델
 scipy        # Hungarian 매칭(linear_sum_assignment) 등 과학 계산
+openpyxl

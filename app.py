@@ -575,7 +575,7 @@ if uploaded_file is not None:
                         out = out.rename(columns={'account':'계정'})
                         for c in ['actual','predicted','error','z','risk']:
                             out[c] = pd.to_numeric(out[c], errors='coerce')
-                        _disp = out[['date','계정','actual','predicted','error','z','risk']].rename(columns={
+                        _disp = out[['date','계정','measure','model','actual','predicted','error','z','risk']].rename(columns={
                             'predicted': '예상 발생액(월 합계)',
                             'error': '차이(실제-예상)'
                         })
@@ -583,6 +583,58 @@ if uploaded_file is not None:
                         st.dataframe(_disp.style.format({
                             'actual':'{:,.0f}', '예상 발생액(월 합계)':'{:,.0f}', '차이(실제-예상)':'{:,.0f}', 'z':'{:+.2f}', 'risk':'{:.2f}'
                         }), use_container_width=True)
+
+                        # === 라인차트 ===
+                        import plotly.graph_objects as go
+
+                        def _make_ts_fig(df_hist: pd.DataFrame, measure: str, title: str):
+                            s = df_hist[['date', measure]].rename(columns={measure: 'actual'}).sort_values('date').copy()
+                            if s.empty:
+                                return None
+                            # 간단 예측선: EMA(shift 1)
+                            s['predicted'] = s['actual'].ewm(span=6, adjust=False).mean().shift(1)
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(x=s['date'], y=s['actual'], mode='lines', name='actual'))
+                            fig.add_trace(go.Scatter(x=s['date'], y=s['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
+                            fig.update_layout(title=title, xaxis_title='month', yaxis_title=measure)
+                            try:
+                                return add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
+                            except Exception:
+                                return fig
+
+                        st.markdown("#### 라인차트")
+                        # 월별 집계에서 flow/balance 히스토리 구성
+                        hist_base = use_ts.rename(columns={'amount':'flow'}).copy()
+                        hist_base = hist_base.sort_values('date')
+                        hist_base['balance'] = hist_base.groupby('account')['flow'].cumsum()
+
+                        # 계정 선택
+                        sel_acc = st.selectbox("계정 선택(라인차트)", sorted(hist_base['account'].unique()), key="ts_plot_acc_main")
+
+                        # BS/PL 판단
+                        _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
+                        is_bs = bool(_mdf[_mdf['계정명'] == sel_acc]['BS/PL'].astype(str).str.upper().eq('BS').any())
+
+                        cur_hist = hist_base[hist_base['account'] == sel_acc].copy()
+                        if cur_hist.empty:
+                            st.info("선택 계정의 월별 데이터가 없습니다.")
+                        else:
+                            if is_bs:
+                                pair = st.toggle("쌍차트 보기(Flow+Balance)", value=True)
+                                if pair:
+                                    c1, c2 = st.columns(2)
+                                    with c1:
+                                        f1 = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                        if f1: st.plotly_chart(f1, use_container_width=True)
+                                    with c2:
+                                        f2 = _make_ts_fig(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
+                                        if f2: st.plotly_chart(f2, use_container_width=True)
+                                else:
+                                    fig = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                    if fig: st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                fig = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
+                                if fig: st.plotly_chart(fig, use_container_width=True)
                     else:
                         st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")
                 with tab5:
@@ -638,7 +690,7 @@ if uploaded_file is not None:
                     ts_monthly['amount'] = ts_monthly['거래금액']
 
                     def _ts_adapter(r: dict) -> EvidenceDetail:
-                        # r: {'account','date','amount','predicted','error','z','z_abs','assertion','risk',...}
+                        # r: {'account','date','amount','predicted','error','z','z_abs','assertion','risk','measure','model',...}
                         acc_key = str(r.get('account', ''))
                         if '|' in acc_key:
                             acc_code, acc_name = acc_key.split('|', 1)
@@ -652,9 +704,11 @@ if uploaded_file is not None:
                             reason=f"예측 대비 {'상회' if float(r.get('error',0))>0 else '하회'}: z={float(r.get('z',0)):+.2f}",
                             anomaly_score=float(a),
                             financial_impact=abs(float(r.get('amount', 0.0))),
-                            risk_score=float(r.get('risk', score)),
+                            # 행에 있는 risk는 PM 미전달로 계산됐을 수 있어 현재 PM 재계산값(score)을 우선 사용
+                            risk_score=float(score),
                             is_key_item=bool(abs(float(r.get('amount',0.0))) >= pm_cur),
-                            measure="flow",
+                            measure=str(r.get('measure', 'flow')),
+                            model=str(r.get('model')) if r.get('model') is not None else None,
                             sign_rule="assets/expenses↑=+, liabilities/equity↑=-",
                             impacted_assertions=sorted({ "A", str(r.get('assertion','A')) }),
                             links={"account_code": str(acc_code), "account_name": str(acc_name), "period_tag": "CY"}
@@ -664,6 +718,7 @@ if uploaded_file is not None:
                     ts_evidences = run_timeseries_module(
                         ts_monthly[['account','date','amount']],
                         evidence_adapter=_ts_adapter,
+                        pm_value=pm_cur,   # 	20<-40 현재 PM 반드시 전달
                     )
 
                     ts_mod = ModuleResult(
@@ -1113,13 +1168,27 @@ if uploaded_file is not None:
 
                             # Step 4) 컨텍스트 생성 + 방법론 노트
                             s.write("④ 컨텍스트 텍스트 구성…")
-                            ctx = generate_rag_context(
+                            # 4-A) 새 경로: ModuleResult 기반 (가능하면 우선 사용)
+                            try:
+                                from analysis.report_adapter import wrap_dfs_as_module_result
+                                from analysis.report import generate_rag_context_from_modules
+                                mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
+                                ctx_modules = generate_rag_context_from_modules(
+                                    [mr_ctx],
+                                    pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
+                                )
+                            except Exception:
+                                ctx_modules = ""
+
+                            # 4-B) 구 경로: DF 기반(폴백)
+                            ctx_legacy = generate_rag_context(
                                 mdf, df_cy, df_py,
                                 account_codes=pick_codes,
                                 manual_context=manual_ctx,
                                 include_risk_summary=True,
                                 pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
                             )
+                            ctx = (ctx_modules or ctx_legacy)
                             note = build_methodology_note(report_accounts=pick_codes)
 
                             # Step 5) LLM 호출 전 점검(길이/토큰)

@@ -73,6 +73,51 @@ def _boldify_bracket_headers(text: str) -> str:
     text = re.sub(r'^\[(요약|주요 거래|결론|용어 설명)\]\s*', r'**[\1]**\n', text, flags=re.MULTILINE)
     return text
 
+# --- NEW: ModuleResult 기반 컨텍스트 (경량 버전) ---
+def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
+    """
+    여러 ModuleResult에서 summary/상위 evidences를 뽑아 간단한 텍스트 컨텍스트를 생성.
+    리포트가 점진적으로 ModuleResult만으로 돌아가도록 하는 전환용 경량 함수.
+    """
+    lines: List[str] = []
+    lines.append(f"[PM] {pm_value:,.0f} KRW")
+    for m in modules or []:
+        try:
+            lines.append(f"\n## Module: {getattr(m, 'name', 'module')}")
+            summ = getattr(m, "summary", None)
+            if summ:
+                lines.append(f"- summary: {summ}")
+            evs = list(getattr(m, "evidences", []))[:20]
+            if evs:
+                lines.append("- evidences(top20):")
+                for e in evs:
+                    # 안전 접근
+                    try:
+                        measure = getattr(e, "measure", None)
+                        model = getattr(e, "model", None)
+                        tag = ""
+                        if measure: tag += f"[{measure}]"
+                        if model:   tag += f"[{model}]"
+                        lnk = getattr(e, "links", {}) or {}
+                        acct_nm = lnk.get("account_name", "")
+                        acct_cd = lnk.get("account_code", "")
+                        risk = float(getattr(e, "risk_score", 0.0))
+                        kit  = bool(getattr(e, "is_key_item", False))
+                        rsn  = str(getattr(e, "reason", ""))
+                        lines.append(f"  	4020• {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit} reason={rsn}")
+                    except Exception:
+                        continue
+            tbls = getattr(m, "tables", None)
+            if tbls:
+                for nm, df in (tbls or {}).items():
+                    try:
+                        lines.append(f"- table[{nm}]: rows={len(df)} cols={len(df.columns)}")
+                    except Exception:
+                        pass
+        except Exception:
+            continue
+    return "\n".join(lines).strip()
+
 
 def _safe_load(s: str):
     """엄격한 JSON 로더: 코드 펜스 제거 후 strict json.loads.
