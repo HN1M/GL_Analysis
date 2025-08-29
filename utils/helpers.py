@@ -52,3 +52,29 @@ def is_credit_account(account_type: str | None, dc: str | None = None) -> bool:
         return t in {"부채", "자본", "수익"}
     except Exception:
         return False
+
+
+# --- NEW: 모델 선택 이유 설명 텍스트 ---
+def model_reason_text(name: str, d: dict) -> str:
+    """
+    간단한 규칙 기반으로 MoR 선택 사유를 자연어로 요약합니다.
+    기대 키: cv_mape_rank, seasonality_strength(0~1), stationary(bool), recent_trend(bool), n_points(int)
+    """
+    try:
+        why = []
+        nm = str(name or "").lower()
+        if d.get("cv_mape_rank") == 1:
+            why.append("교차검증에서 가장 낮은 MAPE를 기록했습니다.")
+        if float(d.get("seasonality_strength", 0.0)) > 0.4 and nm.startswith("prophet"):
+            why.append("연/분기 수준의 계절성이 강하게 관측되었습니다.")
+        if bool(d.get("stationary")) and nm.startswith("arima"):
+            why.append("차분 후 정상성이 확보되어 ARIMA 적합이 유리했습니다.")
+        if bool(d.get("recent_trend")) and (nm.startswith("ema") or nm.startswith("holt") or nm.startswith("exp")):
+            why.append("최근 추세 변화가 커서 최근값 가중 모델이 더 잘 맞았습니다.")
+        if int(d.get("n_points", 0)) < 18 and (nm.startswith("ma") or nm.startswith("ema")):
+            why.append("관측치가 짧아 단순 이동평균 계열이 과적합 위험이 낮았습니다.")
+        if not why:
+            why.append("오차지표(MAE/MAPE)와 정보량(AIC/BIC)을 종합해 최적 모델로 선택되었습니다.")
+        return " / ".join(why)
+    except Exception:
+        return "오차지표(MAE/MAPE)와 정보량(AIC/BIC)을 종합해 최적 모델로 선택되었습니다."

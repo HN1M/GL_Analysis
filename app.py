@@ -555,10 +555,36 @@ if uploaded_file is not None:
 
                 with tab_ts:
                     st.header("시계열 예측(MoR) — 마지막 포인트 요약 + 라인차트")
-                    st.caption("※ 기본값은 '월별 발생액(Δ잔액)'이며, BS 계정은 잔액(balance) 기준도 병행합니다.")
-                    # 항상 노출되는 간단 가이드(2줄)
-                    st.caption("error=실제-예측 (양수=예상보다 큼), |z|≈2 주의 / 3 이상 이례")
-                    st.caption("위험도는 |z|, PM 대비 규모, KIT 여부를 결합한 0~1 점수")
+                    with st.expander("🧭 해석 가이드", expanded=False):
+                        st.markdown(
+                            """
+### 📌 이 화면은 이렇게 읽으세요
+- **σ(시그마) 윈도우**: 최근 *k=6개월* 잔차(실측−예측)의 표준편차로 오차를 표준화합니다. 데이터가 짧으면 시작~현재까지의 **expanding σ**를 사용합니다.  
+- **z(표준화 지수)**: `z = (실측 − 예측) / σ` → |z|≈2는 **이례적(주의)**, |z|≈3은 **매우 이례적**입니다.  
+- **risk(0~1)** = `min(1, 0.5·|z|/3 + 0.3·PM대비 + 0.2·KIT)`  
+  - PM대비 = `min(1, |실측−예측| / PM)`,  **KIT** = PM 초과 여부(True/False)
+- **Flow / Balance**: *Flow*는 **월 발생액(Δ잔액)**, *Balance*는 **월말 잔액**입니다. *(BS 계정은 Balance 기준도 병행 계산합니다.)*
+
+### 📈 차트 읽기
+- 실선=실측, 점선=예측(**MoR**: EMA/MA/ARIMA/Prophet 중 자동 선택)  
+- 회색 점선: **연(굵게)** / **분기(얇게)** 경계선, 붉은 점선: **PM 기준선**  
+- 🔴 **조건 마커**: ***|z| ≥ 3 AND |실측−예측| ≥ PM*** 인 지점만 표기됩니다. (마우스오버: error, z, PM대비)
+
+### 🔎 사용한 예측모델
+- **MA(이동평균)**: 최근 *n*개월 **단순 평균**. **짧은 데이터/변동 완만**할 때 안정적.
+- **EMA(지수이동평균)**: **최근값 가중** 평균. **최근 추세 반영**이 필요할 때 유리.
+- **ARIMA(p,d,q)**: **자기상관** 기반. **계절성이 약(또는 제거 가능)**하고 **데이터가 충분**할 때 강함.
+- **Prophet**: **연/분기 계절성·휴일효과**가 뚜렷할 때 적합(이상치에 비교적 견고).
+
+> :blue[**모델은 계정×기준(Flow/Balance)별로 교차검증 오차(MAPE/MAE)와 (가능하면) 정보량(AIC/BIC)을 종합해 자동 선택됩니다.**]
+
+### ℹ️ 용어(아주 간단히)
+- **정상성**: 시계열의 평균/분산이 시간에 따라 **안 변함**(ARIMA가 특히 선호).
+- **MAE**: 평균 절대 오차(원 단위). **작을수록 정확**.
+- **MAPE**: 상대 오차(%). **규모 다른 계정 비교**에 유용.
+- **AIC/BIC**: 모델 복잡도까지 고려한 **정보량 지표**. **작을수록 우수**.
+"""
+                        )
                     # 모델 가용 배지(디버깅 겸 사용자 안내)
                     try:
                         from analysis.timeseries import model_registry
@@ -566,13 +592,7 @@ if uploaded_file is not None:
                         st.caption(f"지원 모델: EMA ✓ · MA ✓ · ARIMA {'✓' if _reg['arima'] else '—'} · Prophet {'✓' if _reg['prophet'] else '—'}")
                     except Exception:
                         pass
-                    with st.expander("📘 해석 가이드", expanded=False):
-                        st.markdown(
-                            "- **error = 실제 − 예측** (양수면 예상보다 큼)\n"
-                            "- **z**: error가 과거 변동성(σ) 대비 몇 σ인지 (±2 주의, ±3 이례)\n"
-                            "- **risk**: |z|, PM 대비 비중, KIT 여부를 결합한 0~1 점수"
-                        )
-                        st.caption("금액 단위가 큰 계정은 금액 자체보다 z 크기를 우선적으로 보세요.")
+                    # (중복 가이드 제거됨)
                     lf_use = _lf_by_scope()
                     mdf = st.session_state.master_df
                     dfm = lf_use.df.copy()
@@ -611,9 +631,29 @@ if uploaded_file is not None:
                         }), use_container_width=True)
 
                         # === 라인차트 ===
+                        import numpy as _np
                         import plotly.graph_objects as go
                         from analysis.timeseries import insample_predict_df
-                        from utils.viz import add_time_dividers
+                        from utils.viz import add_time_dividers, add_period_guides
+                        # (계절성/정상성 진단 유틸)
+                        def _adf_stationary(y_vals):
+                            try:
+                                from statsmodels.tsa.stattools import adfuller
+                                p = float(adfuller(_np.asarray(y_vals, dtype=float))[1])
+                                return (p < 0.05, p)   # True=정상성 확보
+                            except Exception:
+                                # 간단 폴백: 차분 분산이 원분산보다 충분히 작으면(추세 제거 효과) 정상성으로 간주
+                                y = _np.asarray(y_vals, dtype=float)
+                                if len(y) < 6: return (False, _np.nan)
+                                return (_np.nanstd(_np.diff(y)) < 0.9 * _np.nanstd(y), _np.nan)
+
+                        def _has_seasonality_safe(y_vals):
+                            try:
+                                from analysis.timeseries import _has_seasonality as _hs
+                                import pandas as _pd
+                                return bool(_hs(_pd.Series(y_vals)))
+                            except Exception:
+                                return False
 
                         def _make_ts_fig_with_stats(df_hist: pd.DataFrame, measure: str, title: str):
                             vcol = 'flow' if measure == 'flow' else 'balance'
@@ -639,15 +679,102 @@ if uploaded_file is not None:
                             show_dividers = st.toggle("연/분기 구분선 표시", value=True, key=f"ts_dividers_toggle_{title}")
                             if show_dividers:
                                 try:
-                                    fig = add_time_dividers(fig, ins['date'])
+                                    # paper 높이 전체를 관통하는 가이드
+                                    fig = add_period_guides(fig, ins['date'])
                                 except Exception:
                                     pass
+                            # --- 조건 마커: |z|≥3 AND |error|≥PM ---
+                            try:
+                                import numpy as np
+                                pm_here = float(st.session_state.get("pm_value", PM_DEFAULT))
+                                resid = (ins["actual"] - ins["predicted"]).astype(float)
+                                roll_sd = resid.rolling(6, min_periods=2).std().replace({0.0: np.nan})
+                                z_series = resid / roll_sd
+                                cond = z_series.abs().ge(3) & resid.abs().ge(pm_here)
+                                if cond.any():
+                                    fig.add_trace(go.Scatter(
+                                        x=ins.loc[cond, "date"],
+                                        y=ins.loc[cond, "actual"],
+                                        mode="markers",
+                                        name="flag (|z|≥3 & |err|≥PM)",
+                                        marker=dict(size=8, color="red", symbol="circle-open"),
+                                        hovertext=[
+                                            f"error={e:,.0f}원<br>z={z:+.2f}<br>PM대비={min(1, abs(e)/pm_here):.2f}"
+                                            for e, z in zip(resid[cond], z_series[cond])
+                                        ],
+                                        hoverinfo="text"
+                                    ))
+                            except Exception:
+                                pass
+                            # === 상태 배지(계절성/정상성/데이터 길이) ===
+                            try:
+                                y_vals = _np.asarray(ins['actual'].values, dtype=float)
+                                n_months = int(_np.isfinite(y_vals).sum())
+                                seas = _has_seasonality_safe(y_vals)
+                                stat_ok, pval = _adf_stationary(y_vals)
+                                b1, b2, b3 = st.columns(3)
+                                b1.caption(f"계절성: {'강함' if seas else '약함'}")
+                                b2.caption(f"정상성: {'확보' if stat_ok else '미확보'}" + ("" if _np.isnan(pval) else f" (p={pval:.3f})"))
+                                b3.caption(f"데이터: {n_months}개월 — {'충분' if n_months>=12 else '짧음'}")
+                            except Exception:
+                                pass
+                            # --- 추가: 모델 선택 이유 카드(간단 진단) ---
+                            from utils.helpers import model_reason_text
+                            mae  = float(_np.mean(_np.abs(ins['actual'] - ins['predicted'])))
+                            mape = float(_np.mean(_np.where(ins['actual']!=0, _np.abs((ins['actual']-ins['predicted'])/ins['actual'])*100, 0)))
+                            aic = bic = _np.nan
+                            if str(ins['model'].iloc[-1]).upper() == "ARIMA":
+                                try:
+                                    from analysis.timeseries import _fit_arima
+                                    _y = ins['actual'].reset_index(drop=True)
+                                    _ar = _fit_arima(_y)
+                                    aic = float(getattr(_ar, "aic", _np.nan))
+                                    bic = float(getattr(_ar, "bic", _np.nan))
+                                except Exception:
+                                    pass
+                            y_vals2 = _np.asarray(ins['actual'].values, dtype=float)
+                            n_points = int(_np.isfinite(y_vals2).sum())
+                            recent_trend = False
+                            if n_points >= 6:
+                                x = _np.arange(n_points)
+                                slope = _np.polyfit(x, y_vals2, 1)[0]
+                                recent_trend = abs(slope) > 0.3 * (y_vals2.std() + 1e-9)
+                            try:
+                                import numpy as np
+                                ac = np.abs(np.fft.rfft((y_vals2 - y_vals2.mean())))
+                                core = ac[2:] if ac.size>2 else ac
+                                seas_strength = float(core.max()/(core.mean()+1e-9)) if core.size else 0.0
+                                seas_strength = max(0.0, min((seas_strength-1.0)/4.0, 1.0))
+                            except Exception:
+                                seas_strength = 0.0
+                            diagnostics = {
+                                "n_points": n_points,
+                                "seasonality_strength": seas_strength,
+                                "stationary": bool(stat_ok),
+                                "recent_trend": bool(recent_trend),
+                                "cv_mape_rank": 1,
+                                "mae": mae, "mape": mape, "aic": aic, "bic": bic,
+                            }
+                            best_model_name = str(ins['model'].iloc[-1])
+                            train_months    = int(ins['train_months'].iloc[-1])
+                            span_txt        = str(ins['data_span'].iloc[-1])
+                            sigma_window    = int(ins['sigma_win'].iloc[-1])
+                            st.caption(
+                                f"선택모델: **{best_model_name}** · 학습기간: {span_txt} ({train_months}개월) · "
+                                f"σ윈도우: {sigma_window}개월 · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}% · "
+                                f"AIC: {aic if _np.isfinite(aic) else '—'} · BIC: {bic if _np.isfinite(bic) else '—'}"
+                            )
+                            try:
+                                st.info(model_reason_text(best_model_name, diagnostics))
+                            except Exception:
+                                pass
+
                             stats = {
-                                "모델": str(ins['model'].iloc[-1]),
-                                "학습기간(월)": int(ins['train_months'].iloc[-1]),
-                                "데이터 구간": str(ins['data_span'].iloc[-1]),
-                                "σ 윈도우(최근)": int(ins['sigma_win'].iloc[-1]),
-                                "CV K": 3,
+                                "모델": best_model_name,
+                                "학습기간(월)": train_months,
+                                "데이터 구간": span_txt,
+                                "σ 윈도우(최근)": sigma_window,
+                                "CV(K)": 3,
                             }
                             return fig, stats
 
@@ -767,24 +894,36 @@ if uploaded_file is not None:
                                     with st.expander("이 차트의 통계 설정 보기", expanded=False):
                                         st.write(stx)
 
-                        # (선택) 데이터 검증: trend.py와 월별 대조
-                        try:
-                            from analysis.timeseries import reconcile_with_trend
-                            # timeseries 입력 시리즈(flow, balance)
-                            ts_flow = hist_base[hist_base['account']==sel_acc].set_index('date')['flow']
-                            ts_bal  = hist_base[hist_base['account']==sel_acc].set_index('date')['balance']
-                            # trend 모듈 산출 흐름/잔액 재구성(간단: 같은 집계 방식 재사용)
-                            trend_flow = ts_flow.copy()  # 필요 시 별도 소스와 비교하도록 확장 가능
-                            trend_bal  = ts_bal.copy()
-                            mismatch = reconcile_with_trend(ts_flow, ts_bal, trend_flow, trend_bal)
-                            with st.expander("데이터 검증: trend.py와 대조", expanded=False):
-                                if mismatch is None or mismatch.empty:
-                                    st.success("검증 완료: trend.py와 월별 Flow/Balance가 모두 일치합니다.")
+                        # (선택) 데이터 검증: 월별 추세 분석(막대그래프)으로 직접 대조
+                        with st.expander("데이터 검증: 월별 추세 분석(막대그래프)으로 직접 대조", expanded=False):
+                            try:
+                                mdf = st.session_state.master_df
+                                code_series = mdf.loc[mdf['계정명'] == sel_acc, '계정코드'].astype(str)
+                                if code_series.empty:
+                                    st.info("선택한 계정 코드가 없습니다.")
                                 else:
-                                    st.error("일부 월이 일치하지 않습니다. 아래 표를 확인하세요.")
-                                    st.dataframe(mismatch, use_container_width=True)
-                        except Exception:
-                            pass
+                                    acc_code = code_series.iloc[0]
+                                    lf_use = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
+                                    mod_tr = run_trend_module(lf_use, accounts=[acc_code])
+                                    if mod_tr and mod_tr.figures:
+                                        shown = False
+                                        for title, fig in mod_tr.figures.items():
+                                            is_balance = ("잔액" in title) or ("Balance" in title)
+                                            if (measure == "balance" and is_balance) or (measure == "flow" and not is_balance):
+                                                st.plotly_chart(
+                                                    add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT))),
+                                                    use_container_width=True,
+                                                    key=f"trendbar_{acc_code}_{measure}"
+                                                )
+                                                shown = True
+                                                break
+                                        if not shown:
+                                            _t, _f = list(mod_tr.figures.items())[0]
+                                            st.plotly_chart(_f, use_container_width=True, key=f"trendbar_{acc_code}_{measure}_fallback")
+                                    else:
+                                        st.info("트렌드 막대그래프를 생성할 수 없습니다.")
+                            except Exception as _e:
+                                st.info(f"트렌드 검증을 표시하지 못했습니다: {_e}")
 
                     else:
                         st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")

@@ -215,3 +215,49 @@ def add_time_dividers(fig, xdates, show_quarter: bool = True, show_year_label: b
                     continue
     return fig
 
+
+def add_period_guides(fig, x_series):
+    """
+    월 단위 시계열에 연/분기 경계선 추가.
+    - 연: 1월 시작점(굵기 2.5, dash, gray)
+    - 분기: 3,6,9,12월(얇은 dot, lightgray)
+    도형은 paper 전체 높이(yref='paper')로 그립니다.
+    """
+    try:
+        if isinstance(x_series, pd.Series):
+            xs = pd.to_datetime(x_series)
+        else:
+            xs = pd.to_datetime(pd.Index(x_series))
+        months = pd.DatetimeIndex(xs.sort_values().unique())
+    except Exception:
+        return fig
+    if months.empty:
+        return fig
+
+    # 연 시작(YYYY-01)
+    year_starts = [m for m in months if m.month == 1]
+    for d in year_starts:
+        try:
+            fig.add_shape(
+                type="line", x0=d, x1=d, y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=2.5, dash="dash", color="gray"),
+                layer="below"
+            )
+        except Exception:
+            continue
+
+    # 분기(3,6,9,12)
+    q_marks = [m for m in months if m.month in (3, 6, 9, 12)]
+    for d in q_marks:
+        try:
+            fig.add_shape(
+                type="line", x0=d, x1=d, y0=0, y1=1,
+                xref="x", yref="paper",
+                line=dict(width=1, dash="dot", color="lightgray"),
+                layer="below"
+            )
+        except Exception:
+            continue
+    return fig
+
