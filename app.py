@@ -255,6 +255,9 @@ if uploaded_file is not None:
             master_df = _read_excel(uploaded_file, sheet_name='Master')
             sheet_names = _read_xls(uploaded_file)
             ledger_sheets = [s for s in sheet_names if 'ledger' in s.lower()]
+            if not ledger_sheets:
+                st.error("오류: 'Ledger' 시트를 찾을 수 없습니다.")
+                st.stop()
             all_parts = []
             for s in ledger_sheets:
                 part = _read_excel(uploaded_file, sheet_name=s)
@@ -440,10 +443,12 @@ if uploaded_file is not None:
                         for w in cmod.warnings:
                             st.warning(w)
                         if cmod.figures:
+                            stable_codes = "_".join(map(str, codes)) or "all"
+                            stable_thr = str(int(corr_thr*100))
                             st.plotly_chart(
                                 cmod.figures['heatmap'],
                                 use_container_width=True,
-                                key=f"corr_heatmap_{hash(tuple(codes))}_{corr_thr}"
+                                key=f"corr_heatmap_{stable_codes}_{stable_thr}"
                             )
                         if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
                             st.markdown("**임계치 이상 상관쌍**")
@@ -786,6 +791,10 @@ if uploaded_file is not None:
                     with colm3:
                         st.caption("금액·포맷은 코드에서 강제됩니다.")
 
+                    # 선택한 모델/토큰을 세션에 저장하여 하단 호출부에서 실제 사용
+                    st.session_state['llm_model'] = llm_model_choice
+                    st.session_state['llm_max_tokens'] = int(desired_tokens)
+
                     # --- 입력 영역 ---
                     mdf = st.session_state.master_df
                     ldf = st.session_state.ledger_df
@@ -858,20 +867,23 @@ if uploaded_file is not None:
                                     s.write(f"    └ 데이터가 많아 {max_rows:,}건으로 샘플링")
                                 df_cy_small = ensure_rich_embedding_text(df_cy_small)
                                 try:
-                                    emb_client = LLMClient().client  # OpenAI 클라이언트 객체
+                                    emb_client = LLMClient(model=st.session_state.get('llm_model')).client  # OpenAI 클라이언트 객체
                                     # LLM naming is mandatory for the report
                                     df_clu, ok = perform_embedding_and_clustering(
                                         df_cy_small, emb_client,
                                         name_with_llm=True, must_name_with_llm=True,
                                         use_large=bool(st.session_state.get("use_large_embedding", False)),
                                         rescue_tau=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
+                                        llm_model=st.session_state.get('llm_model', 'gpt-4o'),
                                         embed_texts_fn=get_or_embed_texts,
                                     )
                                     if ok:
                                         # unify near-duplicate names using LLM
                                         from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
                                         df_clu, name_map = unify_cluster_names_with_llm(
-                                            df_clu, emb_client, embed_texts_fn=get_or_embed_texts
+                                            df_clu, emb_client,
+                                            llm_model=st.session_state.get('llm_model', 'gpt-4o'),
+                                            embed_texts_fn=get_or_embed_texts
                                         )
                                         # 추가 LLM 라벨 통합(JSON 매핑 방식) — CY의 cluster_group은 유지
                                         try:
@@ -1072,11 +1084,13 @@ if uploaded_file is not None:
                                 s.write("⑥ LLM 요약 생성 호출…")
                                 try:
                                     t_llm0 = time.perf_counter()
+                                    llm_client = LLMClient(model=st.session_state.get('llm_model'))
                                     final_report = run_final_analysis(
                                         context=ctx + "\n" + note,
                                         account_codes=pick_codes,
-                                        model=llm_model_choice,
-                                        max_tokens=int(desired_tokens),
+                                        model=st.session_state.get('llm_model'),
+                                        max_tokens=int(st.session_state.get('llm_max_tokens', 16000)),
+                                        generate_fn=llm_client.generate,
                                     )
                                     s.write(f"    └ LLM 완료 (경과 {time.perf_counter()-t_llm0:.1f}s)")
                                 except Exception as e:
