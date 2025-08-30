@@ -23,6 +23,14 @@ except ImportError:
     def model_reason_text(model_name, diagnostics):
         return f"Model {model_name} was selected based on cross-validation metrics."
 
+# Optional contracts import for DTO outputs
+try:
+    from analysis.contracts import LedgerFrame, ModuleResult, EvidenceDetail
+except Exception:  # pragma: no cover - keep loose coupling for tests
+    LedgerFrame = None  # type: ignore
+    ModuleResult = None  # type: ignore
+    EvidenceDetail = None  # type: ignore
+
 # -------- Optional config / anomaly imports with safe fallbacks --------
 try:
     from config import PM_DEFAULT as _PM_DEFAULT

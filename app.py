@@ -1158,11 +1158,12 @@ if uploaded_file is not None:
                             # (3) 레거시 DF도 어댑터로 함께 포함(경량 컨텍스트용)
                             mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
                             modules_list = list(st.session_state.get('modules', {}).values()) + [mr_ctx]
-                            # (4) 최종 컨텍스트 생성(Top-K 적용) — 신규 경로만 사용
+                            # (4) 최종 컨텍스트 생성(Top-K 적용) — 신규 경로만 사용 + 메모 주입
                             ctx = generate_rag_context_from_modules(
                                 modules_list,
                                 pm_value=pm_use,
-                                topk=int(st.session_state.get('ctx_topk', 20))
+                                topk=int(st.session_state.get('ctx_topk', 20)),
+                                manual_note=(manual_ctx or "")
                             )
 
                             # (상단 공통 미리보기로 대체)

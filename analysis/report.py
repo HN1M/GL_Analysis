@@ -77,11 +77,19 @@ def _strip_control(s: str) -> str:
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", s or "")
 
 
-# --- ModuleResult 기반 컨텍스트(경량): 점진적 전환용 ---
-def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: float, topk: int = 20) -> str:
+# --- ModuleResult 기반 컨텍스트(경량): 정렬·금액·메모 지원 + Top-K 일관화 ---
+def build_report_context_from_modules(
+    modules: List["ModuleResult"],
+    pm_value: float,
+    topk: int = 20,
+    manual_note: str = ""
+) -> str:
     """
     여러 ModuleResult에서 summary/상위 evidences를 뽑아 간단한 텍스트 컨텍스트를 생성.
-    리포트가 점진적으로 ModuleResult만으로 돌아가도록 하는 전환용 경량 함수.
+    - Evidence 정렬: risk_score → financial_impact 내림차순
+    - 금액 표기: financial_impact를 금액으로 표기
+    - 감사 메모(manual_note) 주입
+    - Top-K 일관 적용
     """
     lines: List[str] = []
     lines.append(f"[PM] {pm_value:,.0f} KRW")
@@ -91,30 +99,46 @@ def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: f
             summ = getattr(m, "summary", None)
             if summ:
                 lines.append(f"- summary: {summ}")
-            evs = list(getattr(m, "evidences", []))[:max(0, int(topk))]
-            if evs:
+
+            # Evidence 정렬(내림차순): 위험도 → 금액
+            evs = list(getattr(m, "evidences", []))
+            def _key(e):
                 try:
-                    k = int(topk)
+                    return (
+                        float(getattr(e, "risk_score", 0.0)),
+                        float(getattr(e, "financial_impact", 0.0)),
+                    )
                 except Exception:
-                    k = 20
+                    return (0.0, 0.0)
+            evs = sorted(evs, key=_key, reverse=True)
+            k = max(0, int(topk))
+
+            if evs and k > 0:
                 lines.append(f"- evidences(top{k}):")
-                for e in evs:
-                    # 안전 접근
+                for e in evs[:k]:
                     try:
-                        measure = getattr(e, "measure", None)
-                        model = getattr(e, "model", None)
-                        tag = ""
-                        if measure: tag += f"[{measure}]"
-                        if model:   tag += f"[{model}]"
                         lnk = getattr(e, "links", {}) or {}
                         acct_nm = lnk.get("account_name", "")
                         acct_cd = lnk.get("account_code", "")
                         risk = float(getattr(e, "risk_score", 0.0))
                         kit  = bool(getattr(e, "is_key_item", False))
+                        amt  = getattr(e, "financial_impact", None)
+                        amt_txt = f" amount={amt:,.0f}" if isinstance(amt, (int, float)) else ""
+                        measure = getattr(e, "measure", None)
+                        model = getattr(e, "model", None)
+                        tag = ""
+                        if measure: tag += f"[{measure}]"
+                        if model:   tag += f"[{model}]"
                         rsn  = str(getattr(e, "reason", ""))
-                        lines.append(_strip_control(f"  - {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit} reason={rsn}"))
+                        lines.append(
+                            _strip_control(
+                                f"  - {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit}{amt_txt} reason={rsn}"
+                            )
+                        )
                     except Exception:
                         continue
+
+            # 표 크기 요약(유지)
             tbls = getattr(m, "tables", None)
             if tbls:
                 for nm, df in (tbls or {}).items():
@@ -124,12 +148,21 @@ def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: f
                         pass
         except Exception:
             continue
+
+    if manual_note:
+        lines.append("\n## Auditor Note\n" + manual_note.strip())
+
     return _strip_control("\n".join(lines)).strip()
 
 
 # Backward-compatible alias with explicit name used in app layer
-def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float, topk: int = 20) -> str:
-    return build_report_context_from_modules(modules, pm_value, topk=topk)
+def generate_rag_context_from_modules(
+    modules: List["ModuleResult"],
+    pm_value: float,
+    topk: int = 20,
+    manual_note: str = ""
+) -> str:
+    return build_report_context_from_modules(modules, pm_value, topk=topk, manual_note=manual_note)
 
 
 def _safe_load(s: str):

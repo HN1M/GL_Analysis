@@ -1,6 +1,6 @@
 import pandas as pd
 import plotly.express as px
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from analysis.contracts import LedgerFrame, ModuleResult
 from utils.viz import add_materiality_threshold
 from utils.helpers import is_credit_account
@@ -77,9 +77,9 @@ def create_monthly_trend_figure(ledger_df: pd.DataFrame, master_df: pd.DataFrame
 # (제거됨) 자동 추천 로직: 사용자가 명시적으로 선택한 계정만 사용
 
 
-def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> ModuleResult:
-    """월별 추이 모듈: 사용자가 선택한 계정만 그린다(자동 추천 없음)."""
-    df = lf.df
+def run_trend_module(lf: LedgerFrame, accounts: Optional[List[str]] = None) -> ModuleResult:
+    """월별 추이 모듈: 선택 계정 필터 + 월별 발생액 tables 제공."""
+    df = lf.df.copy()
     master_df = lf.meta.get("master_df")
     if master_df is None:
         return ModuleResult(
@@ -91,22 +91,34 @@ def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> Modu
             warnings=["Master DF가 없습니다."]
         )
 
-    # ✅ 자동 추천 제거: 계정이 명시적으로 주어지지 않으면 빈 결과 반환
-    if not accounts:
-        return ModuleResult(
-            name="trend",
-            summary={"picked_accounts": [], "n_figures": 0, "period_tag_coverage": {}},
-            tables={},
-            figures={},
-            evidences=[],
-            warnings=["계정이 선택되지 않았습니다. (자동 추천 비활성화)"]
-        )
+    # 계정 필터 강제
+    acc_codes = [str(a) for a in (accounts or [])]
+    if acc_codes:
+        df = df[df['계정코드'].astype(str).isin(acc_codes)]
 
-    acc_codes = [str(a) for a in accounts]
+    # 월별 발생액 집계 테이블
+    try:
+        if '발생액' not in df.columns:
+            # 유연 인식: 거래금액/금액 등에서 대체 가능하면 사용
+            cand = ['거래금액', '거래금액_절대값', 'amount', '금액']
+            alt = next((c for c in cand if c in df.columns), None)
+            if alt is not None:
+                _df = df.rename(columns={alt: '발생액'})
+            else:
+                _df = df.copy()
+        else:
+            _df = df.copy()
+        _df['월'] = _df['회계일자'].dt.to_period('M').astype(str)
+        flow_tbl = (
+            _df.groupby(['계정코드', '월'])['발생액'].sum().reset_index().rename(columns={'발생액': '월별발생액'})
+        )
+    except Exception:
+        flow_tbl = df.head(0).copy()
+
     figures: Dict[str, Any] = {}
     warns: List[str] = []
     pm_value = (lf.meta or {}).get("pm_value")
-    for code in acc_codes:
+    for code in sorted(flow_tbl['계정코드'].astype(str).unique().tolist() if not flow_tbl.empty else acc_codes):
         m = master_df[master_df['계정코드'].astype(str) == code]
         if m.empty:
             warns.append(f"계정코드 {code}가 Master에 없습니다.")
@@ -121,7 +133,7 @@ def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> Modu
             warns.append(f"{name}({code}) 그림 생성 불가(데이터 부족).")
 
     summary = {
-        "picked_accounts": acc_codes,
+        "picked_accounts": acc_codes or sorted(flow_tbl['계정코드'].astype(str).unique().tolist() if not flow_tbl.empty else []),
         "n_figures": len(figures),
         "period_tag_coverage": dict(df['period_tag'].value_counts()) if 'period_tag' in df.columns else {},
     }
@@ -129,7 +141,7 @@ def run_trend_module(lf: LedgerFrame, accounts: List[str] | None = None) -> Modu
     return ModuleResult(
         name="trend",
         summary=summary,
-        tables={},
+        tables={"monthly_flow": flow_tbl},
         figures=figures,
         evidences=[],
         warnings=warns
