@@ -36,7 +36,7 @@ from analysis.vendor import (
     create_vendor_detail_figure,
     run_vendor_module,
 )
-from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note
+from analysis.report import build_report_context, run_final_analysis, build_methodology_note
 from analysis.embedding import (
     ensure_rich_embedding_text,
     perform_embedding_and_clustering,
@@ -634,7 +634,7 @@ if uploaded_file is not None:
 
                         # === 라인차트 ===
                         # Need numpy for checking isnan/isfinite when rendering stats
-                        import numpy as np 
+                                import numpy as np
 
                         st.markdown("#### 라인차트")
                         # 월별 집계에서 flow/balance 히스토리 구성
@@ -712,11 +712,11 @@ if uploaded_file is not None:
                                             st.info(meta.get('reasoning'))
                                     except Exception:
                                         pass
-                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                        with st.expander("이 차트의 통계 설정 보기", expanded=False):
                                         st.write(stats.get("details"))
                                 elif stats and "error" in stats:
                                     st.warning(stats["error"])
-                                else:
+                            else:
                                     st.info("차트를 생성할 데이터가 부족합니다.")
 
                             if is_bs:
@@ -828,7 +828,7 @@ if uploaded_file is not None:
                         import time
                         from analysis.anomaly import compute_amount_columns
                         from analysis.embedding import ensure_rich_embedding_text, perform_embedding_and_clustering
-                        from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note, run_offline_fallback_report
+                        from analysis.report import build_report_context, run_final_analysis, build_methodology_note, run_offline_fallback_report
                         from services.llm import LLMClient
                         from analysis.anomaly import ensure_zscore
 
@@ -1027,9 +1027,9 @@ if uploaded_file is not None:
                             # 4-A) 새 경로: ModuleResult 기반 (가능하면 우선 사용)
                             try:
                                 from analysis.report_adapter import wrap_dfs_as_module_result
-                                from analysis.report import generate_rag_context_from_modules
+                                from analysis.report import build_report_context_from_modules
                                 mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
-                                ctx_modules = generate_rag_context_from_modules(
+                                ctx_modules = build_report_context_from_modules(
                                     [mr_ctx],
                                     pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
                                 )
@@ -1037,7 +1037,7 @@ if uploaded_file is not None:
                                 ctx_modules = ""
 
                             # 4-B) 구 경로: DF 기반(폴백)
-                            ctx_legacy = generate_rag_context(
+                            ctx_legacy = build_report_context(
                                 mdf, df_cy, df_py,
                                 account_codes=pick_codes,
                                 manual_context=manual_ctx,
@@ -3005,7 +3005,7 @@ def _strip_control(s: str) -> str:
 
 
 # --- NEW: ModuleResult 기반 컨텍스트 (경량 버전) ---
-def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
+def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
     """
     여러 ModuleResult에서 summary/상위 evidences를 뽑아 간단한 텍스트 컨텍스트를 생성.
     리포트가 점진적으로 ModuleResult만으로 돌아가도록 하는 전환용 경량 함수.
@@ -3063,7 +3063,7 @@ def _safe_load(s: str):
     return json.loads(text)
 
 
-def generate_rag_context(master_df: pd.DataFrame, current_df: pd.DataFrame, previous_df: pd.DataFrame,
+def build_report_context(master_df: pd.DataFrame, current_df: pd.DataFrame, previous_df: pd.DataFrame,
                          account_codes: List[str], manual_context: str = "",
                          include_risk_summary: bool = False, pm_value: float | None = None) -> str:
     acc_info = master_df[master_df['계정코드'].astype(str).isin(account_codes)]

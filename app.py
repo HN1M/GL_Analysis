@@ -31,7 +31,7 @@ from analysis.vendor import (
     create_vendor_detail_figure,
     run_vendor_module,
 )
-from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note
+from analysis.report import build_report_context, run_final_analysis, build_methodology_note
 from analysis.embedding import (
     ensure_rich_embedding_text,
     perform_embedding_and_clustering,
@@ -94,7 +94,7 @@ def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "")
 
 # --- 3. UI 부분 ---
 st.set_page_config(page_title="AI 분석 시스템 v0.18", layout="wide")
-st.title("AI 분석 시스템 v0.18: 최종 개선 🏗️")
+st.title("훈's GL분석 시스템")
 st.markdown("---")
 
 for key in ['mapping_confirmed', 'analysis_done']:
@@ -628,9 +628,6 @@ if uploaded_file is not None:
                         }), use_container_width=True)
 
                         # === 라인차트 ===
-                        # Need numpy for checking isnan/isfinite when rendering stats
-                        import numpy as np 
-
                         st.markdown("#### 라인차트")
                         # 월별 집계에서 flow/balance 히스토리 구성
                         hist_base = use_ts.rename(columns={'amount':'flow'}).sort_values('date').copy()
@@ -707,6 +704,7 @@ if uploaded_file is not None:
                                             st.info(meta.get('reasoning'))
                                     except Exception:
                                         pass
+                                    # 4. Detailed Stats Expander
                                     with st.expander("이 차트의 통계 설정 보기", expanded=False):
                                         st.write(stats.get("details"))
                                 elif stats and "error" in stats:
@@ -823,7 +821,7 @@ if uploaded_file is not None:
                         import time
                         from analysis.anomaly import compute_amount_columns
                         from analysis.embedding import ensure_rich_embedding_text, perform_embedding_and_clustering
-                        from analysis.report import generate_rag_context, run_final_analysis, build_methodology_note, run_offline_fallback_report
+                        from analysis.report import build_report_context, run_final_analysis, build_methodology_note, run_offline_fallback_report
                         from services.llm import LLMClient
                         from analysis.anomaly import ensure_zscore
 
@@ -1022,9 +1020,9 @@ if uploaded_file is not None:
                             # 4-A) 새 경로: ModuleResult 기반 (가능하면 우선 사용)
                             try:
                                 from analysis.report_adapter import wrap_dfs_as_module_result
-                                from analysis.report import generate_rag_context_from_modules
+                                from analysis.report import build_report_context_from_modules
                                 mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
-                                ctx_modules = generate_rag_context_from_modules(
+                                ctx_modules = build_report_context_from_modules(
                                     [mr_ctx],
                                     pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
                                 )
@@ -1032,7 +1030,7 @@ if uploaded_file is not None:
                                 ctx_modules = ""
 
                             # 4-B) 구 경로: DF 기반(폴백)
-                            ctx_legacy = generate_rag_context(
+                            ctx_legacy = build_report_context(
                                 mdf, df_cy, df_py,
                                 account_codes=pick_codes,
                                 manual_context=manual_ctx,

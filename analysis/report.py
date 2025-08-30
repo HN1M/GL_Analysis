@@ -78,7 +78,7 @@ def _strip_control(s: str) -> str:
 
 
 # --- NEW: ModuleResult 기반 컨텍스트 (경량 버전) ---
-def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
+def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
     """
     여러 ModuleResult에서 summary/상위 evidences를 뽑아 간단한 텍스트 컨텍스트를 생성.
     리포트가 점진적으로 ModuleResult만으로 돌아가도록 하는 전환용 경량 함수.
@@ -136,7 +136,7 @@ def _safe_load(s: str):
     return json.loads(text)
 
 
-def generate_rag_context(master_df: pd.DataFrame, current_df: pd.DataFrame, previous_df: pd.DataFrame,
+def build_report_context(master_df: pd.DataFrame, current_df: pd.DataFrame, previous_df: pd.DataFrame,
                          account_codes: List[str], manual_context: str = "",
                          include_risk_summary: bool = False, pm_value: float | None = None) -> str:
     acc_info = master_df[master_df['계정코드'].astype(str).isin(account_codes)]

@@ -38,12 +38,42 @@
       - **의미 기반 이상치 (Semantic Outliers)**: 각 계정별로 모든 거래(적요) 벡터의 \*\*평균 벡터(Centroid Vector)\*\*를 계산합니다. 개별 거래의 벡터가 자신이 속한 계정의 평균 벡터와 의미적으로 거리가 멀 경우(예: '복리후생비' 계정에 '서버 임차료' 거래), 이를 계정 분류 오류 가능성이 높은 이상치로 탐지합니다.
       - **복합 피처 활용**: Isolation Forest와 같은 머신러닝 모델에 수치 데이터(거래 금액 등)와 텍스트의 벡터 표현을 함께 입력합니다. 이를 통해 "금액은 크지 않지만 내용이 매우 이례적이거나" 혹은 "내용은 평범하지만 금액이 비정상적인" 복합적인 이상 패턴을 효과적으로 식별할 수 있습니다.
 
+      - **[제안] 계정 내 하위 클러스터링(Sub-Clustering)**:
+        - **문제 인식**: '잡이익', '기타비용'처럼 다양한 성격의 거래가 혼재된 계정에서는 단일 Centroid가 의미를 희석시켜 이상치 탐지 정확도가 낮아질 수 있습니다.
+        - **해결 방안**: 계정 단위로 임베딩을 먼저 하위 클러스터링(예: K-Means/HDBSCAN)한 뒤, 각 하위 클러스터의 Centroid와의 거리를 기준으로 이상치를 판단합니다. 동질적 거래 그룹 내부에서의 이탈을 정교하게 포착할 수 있습니다.
+        - **구현 포인트**: `analysis/anomaly.py`에 Sub-Clustering 옵션 추가, `analysis/embedding.py`의 K-Means/HDBSCAN 유틸 재사용, k 자동선정(silhouette 등) 또는 HDBSCAN 기본 파라미터 적용, `EvidenceDetail`에 `cluster_id/cluster_name` 포함.
+        - **현황**: 시스템은 이미 임베딩 및 클러스터링을 수행하며(`analysis/embedding.py`), LLM 기반 이름 부여/정렬을 지원합니다. 본 제안은 이를 이상치 탐지(계정 단위)에도 직접 적용하는 확장입니다.
+
+**B. AI 모델의 신뢰성 및 설명가능성 확보 (XAI & HITL)**
+
+감사/재무 분석 환경에서는 AI 판단 이유와 전문가 개입이 중요합니다.
+
+- **설명가능한 AI(XAI) — SHAP 도입(계획)**
+  - **현황**: `anomaly.py`에서 Isolation Forest 등 모델 해석이 어렵습니다.
+  - **제안**: SHAP을 도입해 이상치 판정에 기여한 피처(금액, 텍스트 이례성, 시간 등)를 수치화하고, 결과를 `EvidenceDetail`에 포함(설명 필드)하여 근거로 활용합니다.
+
+- **Human-in-the-Loop(HITL) 피드백 루프(계획)**
+  - **제안**: 이상치에 대해 사용자가 True/False Positive를 표시하도록 하고, 피드백을 축적해 임계값 조정/주기적 재학습에 활용합니다.
+
+- **도메인 특화 임베딩(장기)**
+  - **제안**: 회계/금융 특화 임베딩 모델(축약어·전문용어 반영)로 전환/병행해 의미 유사도·클러스터 품질 향상.
+
+**C. 위험 점수 산정 체계의 정교화 (Risk Score Calibration)**
+
+모듈별 risk_score 스케일 불일치를 중앙에서 보정합니다.
+
+- **중앙 위험 점수 조정 레이어(계획)**
+  - `analysis/risk_calibration.py`를 도입. 각 모듈은 Raw Score를 반환하고, 중앙 레이어가 0~1로 정규화/스케일링해 통합 점수를 산출합니다.
+
+- **PM 결합 공식/가중치 설정(계획)**
+  - 통계적 유의성(원시 점수)과 재무적 영향(PM 대비)을 결합하는 공식을 정의하고, `config.py`에서 모듈별 가중치를 관리합니다.
+
 **4. 레거시 보고서 유지 및 표준화**
 
 LLM을 사용하지 않는 환경이나 빠른 요약이 필요할 때를 대비하여, 기존의 로컬 규칙 기반 보고서(`run_offline_fallback_report`) 기능을 유지하되, 새로운 DTO 표준에 맞게 재구성합니다.
 
   - **오프라인 폴백 기능**: API 키가 없거나, LLM 호출 비용/시간을 절약하고 싶을 때를 위한 효율적인 대안으로 활용됩니다. Z-Score 상위 항목, KIT(Key Item Test) 통과 항목 등 핵심적인 수치 기반의 요약을 제공합니다.
-  - **DTO 호환성 확보**: 가장 중요한 개선점은 이 레거시 보고서 생성 함수 역시 더 이상 원본 데이터프레임을 직접 받지 않는다는 것입니다. 대신, 다른 모듈과 동일하게 표준화된 `ModuleResult` 리스트를 입력받습니다. 함수는 이 리스트에서 필요한 정보(예: anomaly 모듈 결과의 상위 이상치 테이블)를 꺼내서 자신의 규칙 기반 보고서를 생성합니다. 이를 통해 시스템 전체의 데이터 흐름 일관성을 유지합니다.
+  - **DTO 호환성 확보(계획)**: 보고서 생성 전 과정을 `ModuleResult` 표준으로 통일하는 방향입니다. 현행 코드는 레거시 DF 경로를 어댑터(`analysis/report_adapter.py`)로 감싸 호환합니다.
 
 -----
 
@@ -110,7 +140,7 @@ LLM을 사용하지 않는 환경이나 빠른 요약이 필요할 때를 대비
 ```
 
 1.  **`app.py`**: 사용자가 파일을 업로드하고 분석 옵션(기간, 계정, PM)을 설정합니다.
-2.  **`app.py` → `analysis/` (중앙 오케스트레이션)**: 분석 실행 버튼 클릭 시, `app.py`는 `LedgerFrame`을 구성하여 **모든 분석 모듈을 순차적으로 호출**합니다.
+2.  **`app.py` → `analysis/` (중앙 오케스트레이션)**: 분석 실행 버튼 클릭 시, `app.py`는 `LedgerFrame`을 구성하여 **모든 분석 모듈을 순차적으로 호출**합니다. *(현행: 탭 진입/사용자 상호작용 시 개별 모듈을 지연 실행; 계획상 중앙 오케스트레이션으로 수렴)*
 3.  **`analysis/` → `ModuleResult`**: 각 모듈은 분석 결과를 `ModuleResult` 객체에 담아 반환합니다.
 4.  **`st.session_state`**: `app.py`는 반환된 `ModuleResult` 객체들의 리스트를 **세션 상태에 저장**합니다. 이후 모든 UI 탭은 이 사전 계산된 결과만을 참조합니다.
 5.  **`app.py` (시각화)**: 각 탭은 세션에서 필요한 `ModuleResult`를 꺼내 그 안에 포함된 테이블과 플롯을 화면에 렌더링합니다.
@@ -123,12 +153,12 @@ LLM을 사용하지 않는 환경이나 빠른 요약이 필요할 때를 대비
 
 | 기능 | 담당 모듈 | 역할 및 핵심 로직 | 입력 | 출력 | LLM 활용 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **데이터 정합성** | `analysis/integrity.py` | Master와 Ledger 간 기초/기말 잔액 및 당기 증감액 검증. 데이터 품질 지표(결측률, 텍스트 엔트로피 등) 계산. | `LedgerFrame` | `ModuleResult` (정합성 테이블, 품질 스코어) | 없음 |
+| **데이터 정합성** | `analysis/integrity.py` | Master와 Ledger 간 기초/기말 잔액 및 당기 증감액 검증. 데이터 품질 지표(결측률, 텍스트 엔트로피 등) 계산. | `LedgerFrame` | (현행) 상태+DataFrame / (계획) `ModuleResult` | 없음 |
 | **월별 추세 분석** | `analysis/trend.py` | 계정별 CY vs PY 월별 추이(발생액/잔액) 비교. BS/PL 성격과 차/대변 특성을 반영한 시각화 생성. | `LedgerFrame` | `ModuleResult` (월별 추이 Plotly Figure) | 없음 |
 | **거래처 분석** | `analysis/vendor.py` | 계정별/전체 거래처 집중도(파레토), 월별 활동성(히트맵), 특정 거래처 상세 내역(누적 막대) 분석. | `LedgerFrame` | `ModuleResult` (파레토, 히트맵 등 Figure) | 없음 |
 | **상관/사이클 분석** | `analysis/correlation.py` | 계정 간 월별 흐름의 상관관계(피어슨) 계산 및 히트맵 시각화. 계정명을 기반으로 표준 회계 사이클(R2C, P2P 등)을 자동 그룹화하고, 그룹 간 상관 붕괴/지연 탐지. | `LedgerFrame` | `ModuleResult` (상관 히트맵, 사이클 경고 테이블) | **[해석]** 상관 붕괴 원인 자연어 설명, **[추천]** 계정명 기반 사이클 그룹 제안 |
-| **시계열 예측** | `analysis/timeseries.py` | 계정별 월별 시계열 데이터에 최적 예측 모델(MoR: EMA/MA/ARIMA/Prophet)을 자동 적용. 최종 시점의 예측-실측 간 이탈(Error)을 계산하고 z-score, 위험 점수 산출. | `LedgerFrame` | `ModuleResult` (예측 결과 테이블, 예측 vs 실측 Figure, 예측 이탈 `EvidenceDetail` 리스트) | 없음 |
-| **이상 패턴 탐지** | `analysis/anomaly.py` | **1) 임베딩 및 다차원 분석**: 거래 텍스트를 벡터화하여 계정별 평균 벡터(Centroid) 계산. **2) 의미 기반 이상치**: 개별 거래 벡터와 소속 계정의 Centroid 간 코사인 거리 측정. **3) 복합 이상치**: 수치(금액)와 벡터를 함께 Isolation Forest 모델에 투입. **4) 통계 기반**: Z-Score, 벤포드 법칙. | `LedgerFrame` | `ModuleResult` (이상 전표 테이블, 클러스터 품질 카드, 이상치 `EvidenceDetail` 리스트) | **[이름 부여]** 텍스트 임베딩 클러스터에 LLM으로 자동 이름 부여 |
+| **시계열 예측** | `analysis/timeseries.py` | 계정별 월별 시계열 데이터에 최적 예측 모델(MoR: EMA/MA/ARIMA/Prophet)을 자동 적용. 최종 시점의 예측-실측 간 이탈(Error)을 계산하고 z-score, 위험 점수 산출. | `LedgerFrame` | (현행) DataFrame / (계획) `ModuleResult` + Evidence | 없음 |
+| **이상 패턴 탐지** | `analysis/anomaly.py` | **1) 임베딩 및 다차원 분석**(리포트 경로 중심 활용) + **2) 통계 기반(Z-Score)** 중심. (제안) 계정 내 Sub-Clustering을 이상치 판단에도 직접 활용. | `LedgerFrame` | `ModuleResult` (이상 전표 테이블, Evidence 리스트) | **[이름 부여]** LLM 기반 클러스터 네이밍/정렬(리포트 경로) |
 | **AI 리포트** | `services/llm.py`, `analysis/report.py` | **1) `report.py`**: 각 `ModuleResult`의 `summary`와 `evidences`, 사용자 메모를 종합하여 최종 컨텍스트(RAG용) 생성. **2) `llm.py`**: 생성된 컨텍스트로 LLM 호출 또는 프롬프트 제공. **3) (폴백)** `run_offline_fallback_report`는 `ModuleResult` 리스트에서 필요 정보를 추출하여 규칙 기반 보고서 생성. | `List[ModuleResult]` | 최종 보고서 `string` 또는 `prompt string` | **[생성]** 종합 분석 결과를 바탕으로 최종 보고서 초안 작성 |
 
 -----
@@ -148,7 +178,7 @@ gl-analysis-system/
 │   ├── timeseries.py       # 시계열 예측 및 이탈 분석
 │   ├── anomaly.py          # 통계/AI 기반 이상 패턴 탐지
 │   ├── embedding.py        # 텍스트 임베딩 및 클러스터링 로직
-│   ├── services/
+├── services/
 │   ├── llm.py              # LLM(OpenAI) 호출 클라이언트 및 관련 유틸
 │   ├── cache.py            # 임베딩, 예측 결과 등 비용 큰 연산 캐시 관리
 │   └── external.py         # (확장용) 외부 API(휴일, 뉴스 등) 연동
@@ -166,8 +196,8 @@ gl-analysis-system/
 ├── .env                    # ❗ (Git 무시) API 키 등 민감 정보 저장
 ├── app.py                  #  애플리케이션의 메인 진입점 (Streamlit)
 ├── config.py               # ❗ 애플리케이션 전체 설정 (PM, 모델 파라미터 등)
-├── Dockerfile              # ❗ 컨테이너화된 배포 환경 정의
-├── PROJECT_BLUEPRINT.md    # ❗ 바로 이 청사진 문서
+├── (Optional) Dockerfile   # 컨테이너화된 배포 환경 정의(현 시점 미포함)
+├── (Optional) PROJECT_BLUEPRINT.md  # 기획 청사진 문서(현 시점 미포함)
 └── requirements.txt        # ❗ 프로젝트 파이썬 의존성 및 버전 고정
 
 ```
