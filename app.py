@@ -36,11 +36,10 @@ from analysis.anomaly import calculate_grouped_stats_and_zscore
 from services.llm import LLMClient
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU
 try:
-    from config import PM_DEFAULT, PROVISIONAL_RULE_NAME, provisional_risk_formula_str
+    from config import PM_DEFAULT
 except Exception:
     PM_DEFAULT = 500_000_000
 from utils.viz import add_materiality_threshold, add_pm_badge
-from analysis.assertion_risk import build_matrix
 
 # --- KRW 입력(천단위 콤마) 유틸: 콜백 기반으로 안정화 ---
 def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "") -> int:
@@ -348,7 +347,7 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab1, tab2, tab3, tab4, tab_ts, tab5, tab6 = st.tabs(["📈 대시보드", "🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열/예측", "⚠️ 위험 평가", "🤖 AI 리포트"])
+                tab1, tab2, tab3, tab4, tab_ts, tab_report = st.tabs(["📈 대시보드", "🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🤖 AI 리포트"])
 
                 with tab1:  # ...
                     st.header("핵심 요약 대시보드")
@@ -531,7 +530,7 @@ if uploaded_file is not None:
                         st.info("분석할 거래처 데이터가 없습니다.")
 
                 with tab4:
-                    st.header("이상 패턴 탐지 (v1: Z-Score)")
+                    st.header("이상 패턴 탐지")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     mdf = st.session_state.master_df
                     acct_names = mdf['계정명'].unique()
@@ -554,35 +553,34 @@ if uploaded_file is not None:
                             st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True, key="anomaly_hist")
 
                 with tab_ts:
-                    st.header("시계열 예측(MoR) — 마지막 포인트 요약 + 라인차트")
+                    st.header("시계열 예측")
                     with st.expander("🧭 해석 가이드", expanded=False):
                         st.markdown(
                             """
-### 📌 이 화면은 이렇게 읽으세요
-- **σ(시그마) 윈도우**: 최근 *k=6개월* 잔차(실측−예측)의 표준편차로 오차를 표준화합니다. 데이터가 짧으면 시작~현재까지의 **expanding σ**를 사용합니다.  
-- **z(표준화 지수)**: `z = (실측 − 예측) / σ` → |z|≈2는 **이례적(주의)**, |z|≈3은 **매우 이례적**입니다.  
-- **risk(0~1)** = `min(1, 0.5·|z|/3 + 0.3·PM대비 + 0.2·KIT)`  
+### 용어
+- **z(표준화 지수)**: `z = (실측 − 예측) / σ`  
+  - 월별 예측 잔차(실측-예측)를 표준화한 지수입니다. **이상 패턴 탐지의 Z-Score와 다른 개념입니다.**
+  - |z|≈2는 **이례적**, |z|≈3은 **매우 이례적**입니다.  
+- **σ(표준편차) 집계**: 최근 *k=6개월* 잔차의 표준편차로 표준화합니다. 데이터가 짧으면 시작~현재까지의 **expanding σ**를 사용합니다.  
+- **위험도(0~1)** = `min(1, 0.5·|z|/3 + 0.3·PM대비 + 0.2·KIT)`  
   - PM대비 = `min(1, |실측−예측| / PM)`,  **KIT** = PM 초과 여부(True/False)
 - **Flow / Balance**: *Flow*는 **월 발생액(Δ잔액)**, *Balance*는 **월말 잔액**입니다. *(BS 계정은 Balance 기준도 병행 계산합니다.)*
+- **정상성**: 시계열의 평균/분산이 시간에 따라 **안 변함**(ARIMA가 특히 선호).
+- **MAE**: 평균 절대 오차(원 단위). **작을수록 정확**.
+- **MAPE**: 상대 오차(%). **규모 다른 계정 비교**에 유용.
+- **AIC/BIC**: 모델 복잡도까지 고려한 **정보량 지표**. **작을수록 우수**.
 
-### 📈 차트 읽기
+### 차트 읽기
 - 실선=실측, 점선=예측(**MoR**: EMA/MA/ARIMA/Prophet 중 자동 선택)  
-- 회색 점선: **연(굵게)** / **분기(얇게)** 경계선, 붉은 점선: **PM 기준선**  
-- 🔴 **조건 마커**: ***|z| ≥ 3 AND |실측−예측| ≥ PM*** 인 지점만 표기됩니다. (마우스오버: error, z, PM대비)
+- 회색 점선: **연(굵게)** / **분기(얇게)** 경계선, 붉은 점선: **PM 기준선**
 
-### 🔎 사용한 예측모델
+### 사용한 예측모델
 - **MA(이동평균)**: 최근 *n*개월 **단순 평균**. **짧은 데이터/변동 완만**할 때 안정적.
 - **EMA(지수이동평균)**: **최근값 가중** 평균. **최근 추세 반영**이 필요할 때 유리.
 - **ARIMA(p,d,q)**: **자기상관** 기반. **계절성이 약(또는 제거 가능)**하고 **데이터가 충분**할 때 강함.
 - **Prophet**: **연/분기 계절성·휴일효과**가 뚜렷할 때 적합(이상치에 비교적 견고).
 
 > :blue[**모델은 계정×기준(Flow/Balance)별로 교차검증 오차(MAPE/MAE)와 (가능하면) 정보량(AIC/BIC)을 종합해 자동 선택됩니다.**]
-
-### ℹ️ 용어(아주 간단히)
-- **정상성**: 시계열의 평균/분산이 시간에 따라 **안 변함**(ARIMA가 특히 선호).
-- **MAE**: 평균 절대 오차(원 단위). **작을수록 정확**.
-- **MAPE**: 상대 오차(%). **규모 다른 계정 비교**에 유용.
-- **AIC/BIC**: 모델 복잡도까지 고려한 **정보량 지표**. **작을수록 우수**.
 """
                         )
                     # 모델 가용 배지(디버깅 겸 사용자 안내)
@@ -601,10 +599,18 @@ if uploaded_file is not None:
                                .reset_index().rename(columns={'계정명':'account','연월':'date','거래금액':'amount'}))
                     pick_accounts_ts = st.multiselect("대상 계정", sorted(agg['account'].unique()), default=[], key="ts_accounts")
                     use_ts = agg if not pick_accounts_ts else agg[agg['account'].isin(pick_accounts_ts)]
-                    from analysis.timeseries import run_timeseries_module as _ts_run
-                    res = _ts_run(use_ts.rename(columns={'account':'account','date':'date','amount':'amount'}),
-                                  account_col='account', date_col='date', amount_col='amount',
-                                  pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                    # BS 여부를 반영해 balance 기준도 병행 계산
+                    try:
+                        bs_map = st.session_state.master_df[['계정명','BS/PL']].drop_duplicates()
+                        _bs_flag = bs_map.set_index('계정명')['BS/PL'].map(lambda x: str(x).upper()== 'BS').to_dict()
+                    except Exception:
+                        _bs_flag = {}
+                    work_ts = use_ts.copy()
+                    work_ts['is_bs'] = work_ts['account'].map(lambda name: bool(_bs_flag.get(str(name), False)))
+                    from analysis.timeseries import run_timeseries_module_with_flag as _ts_run_flag
+                    res = _ts_run_flag(work_ts.rename(columns={'account':'account','date':'date','amount':'amount','is_bs':'is_bs'}),
+                                       account_col='account', date_col='date', amount_col='amount', is_bs_col='is_bs',
+                                       pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
                     if not res.empty:
                         out = res.copy()
                         out = out.rename(columns={'account':'계정'})
@@ -625,7 +631,7 @@ if uploaded_file is not None:
                             'z': '표준화지수(z)',
                             'risk': '위험도(0~1)'
                         })
-                        st.caption("MoR(최적 모델) 기준. BS는 balance 기준도 병행 계산합니다(요약 테이블에는 flow가 기본).")
+                        st.caption("MoR(최적 모델) 기준. BS 계정은 balance 기준도 함께 표시합니다.")
                         st.dataframe(_disp.style.format({
                             '실제(월 합계)':'{:,.0f}', '예측(월 합계)':'{:,.0f}', '차이(실제-예측)':'{:,.0f}', '표준화지수(z)':'{:+.2f}', '위험도(0~1)':'{:.2f}'
                         }), use_container_width=True)
@@ -683,29 +689,7 @@ if uploaded_file is not None:
                                     fig = add_period_guides(fig, ins['date'])
                                 except Exception:
                                     pass
-                            # --- 조건 마커: |z|≥3 AND |error|≥PM ---
-                            try:
-                                import numpy as np
-                                pm_here = float(st.session_state.get("pm_value", PM_DEFAULT))
-                                resid = (ins["actual"] - ins["predicted"]).astype(float)
-                                roll_sd = resid.rolling(6, min_periods=2).std().replace({0.0: np.nan})
-                                z_series = resid / roll_sd
-                                cond = z_series.abs().ge(3) & resid.abs().ge(pm_here)
-                                if cond.any():
-                                    fig.add_trace(go.Scatter(
-                                        x=ins.loc[cond, "date"],
-                                        y=ins.loc[cond, "actual"],
-                                        mode="markers",
-                                        name="flag (|z|≥3 & |err|≥PM)",
-                                        marker=dict(size=8, color="red", symbol="circle-open"),
-                                        hovertext=[
-                                            f"error={e:,.0f}원<br>z={z:+.2f}<br>PM대비={min(1, abs(e)/pm_here):.2f}"
-                                            for e, z in zip(resid[cond], z_series[cond])
-                                        ],
-                                        hoverinfo="text"
-                                    ))
-                            except Exception:
-                                pass
+                            # (삭제됨) 조건 마커: |z|≥3 AND |error|≥PM
                             # === 상태 배지(계절성/정상성/데이터 길이) ===
                             try:
                                 y_vals = _np.asarray(ins['actual'].values, dtype=float)
@@ -898,272 +882,9 @@ if uploaded_file is not None:
 
                     else:
                         st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")
-                with tab5:
-                    st.header("계정 × 주장(CEAVOP) 위험 평가")
-                    # 잠정 기준 안내 배지
-                    try:
-                        st.info(f"ⓘ 통합 위험점수는 {PROVISIONAL_RULE_NAME}에 따라 {provisional_risk_formula_str()}로 계산되었습니다.")
-                        st.caption("ⓘ CEAVOP 주장은 기본 규칙(예: 예측 상회→E, 하회→C)에 따라 자동 제안되었으며, 전문가의 검토가 필요합니다.")
-                    except Exception:
-                        pass
-                    st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')} · PM={float(st.session_state.get('pm_value', PM_DEFAULT)):,.0f}원")
-                    # ✅ 한글 가이드: 좌/우 2열 레이아웃
-                    g_left, g_right = st.columns([0.48, 0.52])
-                    with g_left:
-                        st.markdown("#### 어떻게 읽나요?")
-                        st.markdown(
-                            "- 히트맵의 각 셀은 **계정 × 주장** 조합에 대한 통합 위험점수(0~1)의 *최대값*입니다.\n"
-                            "- 위험점수는 **|Z-Score|**, **PM 대비 금액비율**, **Key Item(PM 초과)** 여부를 결합합니다.\n"
-                            "- 좌측 사이드바의 **Performance Materiality(PM)** 를 조정하면 KIT 플래그와 히트맵 강도가 함께 변합니다."
-                        )
-                        st.markdown("#### CEAVOP(주장) 간단 해설")
-                        st.info(
-                            "C(완전성): 누락 없이 모두 반영되었는가?\n\n"
-                            "E(존재): 기록된 거래가 실제 존재하는가?\n\n"
-                            "A(정확성): 금액/계산이 정확한가?\n\n"
-                            "V(평가·배분): 적절한 평가·배분이 되었는가?\n\n"
-                            "O(발생): 발생사실/권리·의무가 타당한가?\n\n"
-                            "P(표시·공시): 적절히 분류·표시·공시되었는가?"
-                        )
-                    with g_right:
-                        st.markdown("#### 히트맵")
-                    lf_use = _lf_by_scope()
-                    # 전체 스코프 기준으로 이상치 모듈을 실행(리스크 에비던스 확보)
-                    amod_full = run_anomaly_module(lf_use, target_accounts=None, topn=200, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
-
-                    # --- [ADD] 타임시리즈 Evidence 생성 & 결합 ---
-                    from analysis.timeseries import run_timeseries_module
-                    from analysis.contracts import EvidenceDetail, ModuleResult
-                    from analysis.anomaly import _risk_from  # anomaly_score 정합성 유지용
-
-                    pm_cur = float(st.session_state.get("pm_value", PM_DEFAULT))
-
-                    # 1) 월 시계열 집계(계정 × 월, 금액=거래금액 합계)
-                    ts_base = lf_use.df.copy()
-                    ts_base['연월'] = ts_base['회계일자'].dt.to_period('M')
-                    ts_monthly = (
-                        ts_base.groupby(['계정코드','계정명','연월'], as_index=False)['거래금액']
-                               .sum()
-                    )
-                    # run_timeseries_module는 account/date/amount 3컬럼만 사용 → code|name로 메타 보존
-                    ts_monthly['account'] = ts_monthly.apply(lambda r: f"{str(r['계정코드'])}|{str(r['계정명'])}", axis=1)
-                    ts_monthly['date'] = ts_monthly['연월'].dt.to_timestamp('M')
-                    ts_monthly['amount'] = ts_monthly['거래금액']
-
-                    def _ts_adapter(r: dict) -> EvidenceDetail:
-                        # r: {'account','date','amount','predicted','error','z','z_abs','assertion','risk','measure','model',...}
-                        acc_key = str(r.get('account', ''))
-                        if '|' in acc_key:
-                            acc_code, acc_name = acc_key.split('|', 1)
-                        else:
-                            acc_code, acc_name = acc_key, acc_key
-                        dt = r.get('date')
-                        yyyymm = dt.strftime('%Y-%m') if hasattr(dt, 'strftime') else str(dt)
-                        a, f, k, score = _risk_from(float(r.get('z_abs', 0.0)), float(r.get('amount', 0.0)), pm_cur)
-                        return EvidenceDetail(
-                            row_id=f"TS::{acc_code}::{yyyymm}",
-                            reason=f"예측 대비 {'상회' if float(r.get('error',0))>0 else '하회'}: z={float(r.get('z',0)):+.2f}",
-                            anomaly_score=float(a),
-                            financial_impact=abs(float(r.get('amount', 0.0))),
-                            # 행에 있는 risk는 PM 미전달로 계산됐을 수 있어 현재 PM 재계산값(score)을 우선 사용
-                            risk_score=float(score),
-                            is_key_item=bool(abs(float(r.get('amount',0.0))) >= pm_cur),
-                            measure=str(r.get('measure', 'flow')),
-                            model=str(r.get('model')) if r.get('model') is not None else None,
-                            sign_rule="assets/expenses↑=+, liabilities/equity↑=-",
-                            impacted_assertions=sorted({ "A", str(r.get('assertion','A')) }),
-                            links={"account_code": str(acc_code), "account_name": str(acc_name), "period_tag": "CY"}
-                        )
-
-                    # 2) EvidenceDetail 리스트 생성
-                    ts_evidences = run_timeseries_module(
-                        ts_monthly[['account','date','amount']],
-                        evidence_adapter=_ts_adapter,
-                        pm_value=pm_cur,   # 	20<-40 현재 PM 반드시 전달
-                    )
-
-                    ts_mod = ModuleResult(
-                        name="timeseries",
-                        summary={"n_rows": len(ts_monthly), "n_evidences": len(ts_evidences)},
-                        tables={},
-                        figures={},
-                        evidences=ts_evidences,
-                        warnings=[]
-                    )
-
-                    # 3) 위험 매트릭스: 이상치 + 예측 Evidence 동시 반영
-                    mat, emap = build_matrix([amod_full, ts_mod])
-                    if mat.empty:
-                        st.info("위험 매트릭스를 생성할 Evidence가 없습니다.")
-                    else:
-                        import plotly.express as px
-                        fig = px.imshow(mat, aspect='auto', origin='upper',
-                                        title="계정 × 주장 위험 히트맵 (max risk_score, 0~1)",
-                                        labels=dict(x="Assertion", y="Account", color="Risk"))
-                        fig.update_coloraxes(cmin=0, cmax=1)
-                        st.plotly_chart(fig, use_container_width=True, key="risk_heatmap")
-                        with st.expander("수치 테이블 보기", expanded=False):
-                            st.dataframe(mat, use_container_width=True)
-                        # 🔽 전체 Evidence CSV 내보내기 (행렬 근거 전부)
-                        from dataclasses import asdict
-                        all_evs = (amod_full.evidences or []) + (ts_mod.evidences or [])
-                        if all_evs:
-                            ev_all_df = pd.DataFrame([asdict(e) for e in all_evs])
-                            # impacted_assertions 리스트 문자열화
-                            if 'impacted_assertions' in ev_all_df.columns:
-                                ev_all_df['impacted_assertions'] = ev_all_df['impacted_assertions'].apply(
-                                    lambda xs: ",".join(xs) if isinstance(xs, list) else str(xs)
-                                )
-                            # links 평탄화
-                            if 'links' in ev_all_df.columns:
-                                _lnk = pd.json_normalize(ev_all_df['links']).add_prefix('links.')
-                                ev_all_df = pd.concat([ev_all_df.drop(columns=['links']), _lnk], axis=1)
-                            # 컬럼 순서 고정
-                            _ORDER = ['row_id','risk_score','anomaly_score','financial_impact','is_key_item',
-                                      'impacted_assertions','links.account_code','links.account_name','links.period_tag','reason']
-                            for col in _ORDER:
-                                if col not in ev_all_df.columns:
-                                    ev_all_df[col] = ""
-                            ev_all_df = ev_all_df[_ORDER]
-                            st.download_button(
-                                "📥 Evidence 전체 CSV 다운로드",
-                                ev_all_df.to_csv(index=False).encode('utf-8-sig'),
-                                file_name="evidence_all.csv",
-                                mime="text/csv"
-                            )
-
-                        # 드릴다운: 계정/주장 선택 → 근거 표시
-                        st.subheader("🔎 드릴다운: 특정 셀의 근거(Evidence)")
-                        acct = st.selectbox("계정(행)", ["선택하세요..."] + mat.index.tolist(), index=0, help="조사할 계정(행)을 선택하세요.", key="risk_dd_account")
-                        asrt = st.selectbox("주장(열)", ["선택하세요..."] + list(mat.columns), index=0, help="관리자의 주장(CEAVOP) 중에서 선택하세요.", key="risk_dd_assertion")
-                        # 선택한 주장에 대한 짧은 설명
-                        _asrt_help = {
-                            "C":"완전성", "E":"존재", "A":"정확성", "V":"평가·배분",
-                            "O":"발생", "P":"표시·공시"
-                        }
-                        if asrt in _asrt_help:
-                            st.caption(f"선택한 주장 설명: **{asrt} – {_asrt_help[asrt]}**")
-                        if acct != "선택하세요..." and asrt != "선택하세요...":
-                            from dataclasses import asdict
-                            ev_all = st.session_state.get('amod_full_evidences') or amod_full.evidences
-                            st.session_state['amod_full_evidences'] = ev_all
-                            def _match_ev(e, acct_name, asrt_code):
-                                name_ok = (e.links.get("account_name") == acct_name) or (e.links.get("account_code") == acct_name)
-                                asrt_ok = asrt_code in (e.impacted_assertions or [])
-                                return bool(name_ok and asrt_ok)
-                            direct_hits = [asdict(e) for e in ev_all if _match_ev(e, acct, asrt)]
-                            row_ids = emap.get((acct, asrt), [])
-                            by_id_hits = [asdict(e) for e in ev_all if str(e.row_id) in row_ids]
-                            rows = direct_hits or by_id_hits
-                            ev_df = pd.DataFrame(rows)
-                            if not ev_df.empty:
-                                ev_df['impacted_assertions'] = ev_df['impacted_assertions'].apply(lambda xs: ",".join(xs) if isinstance(xs, list) else str(xs))
-                                show_cols = ['row_id','risk_score','is_key_item','anomaly_score','financial_impact','impacted_assertions','reason']
-                                st.dataframe(ev_df[show_cols].sort_values('risk_score', ascending=False), use_container_width=True)
-                            else:
-                                st.info("해당 셀에서 표시할 Evidence 레코드를 찾지 못했습니다. (키 미스매치 방지 로직 적용 완료)")
-
-                        # 예측 Evidence 요약(듀얼 기준 + MoR)
-                        with st.expander("🔮 예측 기반 Evidence(요약) — 계정별 마지막 포인트", expanded=False):
-                            def _acc_label(k: str) -> str:
-                                return (k.split('|',1)[1] if '|' in str(k) else str(k))
-                            # 계정별 월 집계
-                            base = ts_monthly[['account','date','amount']].copy()
-                            base = base.rename(columns={'amount':'flow'})
-                            base['balance'] = base.groupby('account')['flow'].cumsum()
-                            # BS/PL 매핑
-                            bs_map = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
-                            bs_map['key'] = bs_map['계정코드'].astype(str) + '|' + bs_map['계정명'].astype(str)
-                            bs_flag = bs_map.set_index('key')['BS/PL'].map(lambda x: str(x).upper()=='BS').to_dict()
-                            from analysis.timeseries import run_timeseries_for_account
-                            rows_ts = []
-                            for acc, g in base.groupby('account'):
-                                is_bs = bool(bs_flag.get(str(acc), True))  # 정보없으면 True로 보수적 처리
-                                out = run_timeseries_for_account(
-                                    g[['date','flow','balance']], _acc_label(str(acc)),
-                                    is_bs=is_bs, flow_col='flow', balance_col='balance',
-                                    pm_value=float(st.session_state.get("pm_value", PM_DEFAULT))
-                                )
-                                if not out.empty:
-                                    rows_ts.append(out)
-                            # 보기 범위 토글은 항상 노출
-                            scope = st.selectbox("보기 범위", options=["flow","balance","both"], index=2, key="ts_scope_main")
-                            if rows_ts:
-                                df_ts = pd.concat(rows_ts, ignore_index=True)
-                                st.caption("BS 계정은 잔액·발생액 기준을 병행 계산합니다. 표시 기준은 위 토글을 따릅니다.")
-                                st.caption("본 예측은 **PY+CY 연속 월**(보간 없음)로 학습하고 MoR(최적 모델)을 사용합니다. error는 z와 함께 해석하세요.")
-                                df_view = df_ts if scope == "both" else df_ts[df_ts['measure'] == scope]
-                                st.dataframe(df_view[['date','account','measure','actual','predicted','error','z','risk','model']], use_container_width=True)
-
-                                # === (교체) 계정/기준 선택 라인/쌍차트 ===
-                                import plotly.graph_objects as go
-
-                                def _make_ts_fig(df_hist: pd.DataFrame, measure: str, title: str):
-                                    """EMA 기반 예측선을 같이 그려주는 간단 라인차트(실선=actual, 점선=pred)."""
-                                    s = df_hist[['date', measure]].rename(columns={measure: 'actual'}).sort_values('date').copy()
-                                    if s.empty:
-                                        return None
-                                    # EMA 예측선(shift 1)
-                                    s['predicted'] = s['actual'].ewm(span=6, adjust=False).mean().shift(1)
-                                    fig = go.Figure()
-                                    fig.add_trace(go.Scatter(x=s['date'], y=s['actual'], mode='lines', name='actual'))
-                                    fig.add_trace(go.Scatter(x=s['date'], y=s['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
-                                    fig.update_layout(title=title, xaxis_title='month', yaxis_title=measure)
-                                    try:
-                                        return add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
-                                    except Exception:
-                                        return fig
-
-                                # ── 선택 계정
-                                sel_acc = st.selectbox("계정 선택", sorted(df_ts["account"].unique()), key="ts_plot_acc")
-
-                                # 히스토리(월별 flow/balance 재구성)
-                                hist_base = use_ts.copy()  # use_ts는 위에서 만든 monthly agg (account,date,amount)
-                                # 계정별로 flow/balance 동시 구성
-                                hist_base = hist_base.rename(columns={'amount':'flow'})
-                                hist_base['balance'] = hist_base.sort_values('date').groupby('account')['flow'].cumsum()
-
-                                cur_hist = hist_base[hist_base['account'] == sel_acc].copy()
-                                if cur_hist.empty:
-                                    st.info("선택 계정의 월별 데이터가 없습니다.")
-                                else:
-                                    # BS 여부 판단 (Master의 BS/PL 활용)
-                                    _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL']].drop_duplicates()
-                                    # 계정명이 같은 항목을 찾아 BS/PL 확인 (없으면 PL 취급)
-                                    try:
-                                        is_bs = bool(_mdf[_mdf['계정명'] == sel_acc]['BS/PL'].astype(str).str.upper().eq('BS').any())
-                                    except Exception:
-                                        is_bs = False
-
-                                    pair = st.toggle("쌍차트 보기(Flow+Balance)", value=is_bs, disabled=not is_bs)
-                                    if pair and is_bs:
-                                        c1, c2 = st.columns(2)
-                                        with c1:
-                                            f1 = _make_ts_fig(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                            if f1: st.plotly_chart(f1, use_container_width=True)
-                                        with c2:
-                                            f2 = _make_ts_fig(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
-                                            if f2: st.plotly_chart(f2, use_container_width=True)
-                                    else:
-                                        measure = st.radio("기준(Measure)", ["flow","balance"], horizontal=True, index=0 if not is_bs else 0,
-                                                           help="BS가 아닌 계정은 balance가 의미 없을 수 있습니다.")
-                                        fig = _make_ts_fig(cur_hist, measure, f"{sel_acc} — {measure.title()} (actual vs MoR)")
-                                        if fig: st.plotly_chart(fig, use_container_width=True)
-
-                                # CSV 내보내기(항상 두 기준 포함)
-                                st.download_button(
-                                    "📥 예측 요약 CSV 다운로드(듀얼기준)",
-                                    data=df_ts.to_csv(index=False).encode('utf-8-sig'),
-                                    file_name="evidence_timeseries_dual.csv",
-                                    mime="text/csv",
-                                    key="ts_csv_dl"
-                                )
-                            else:
-                                st.info("최근 포인트 기준 예측 이탈 Evidence가 없습니다.")
-
-                        # (중복) 드릴다운 블럭 제거 — 위에 이미 1회 존재
-
-                with tab6:
+                # ⚠️ 기존 tab5(위험평가) 블록 전체 삭제됨
+                
+                with tab_report:
                     st.header("AI 리포트 및 채팅")
                     # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능
                     LLM_OK = False

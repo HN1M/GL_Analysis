@@ -244,6 +244,7 @@ def _one_track_lastrow(
         "predicted": float(yhat[-1]),
         "error": float(error_last),
         "z": float(z),
+        "z_label": "resid_z",
         "risk": float(risk),
         "model": model,
     }

@@ -9,6 +9,7 @@
         - **`박팀장 (10년차 기업 재무팀장)`**: 월 결산 후 내부 검토용으로 재무 데이터의 특이사항을 빠르게 파악하고 싶어 함. 경영진 보고 자료에 포함할 인사이트가 필요.
     - **핵심 시나리오 (User Stories)**:
         - **"김감사는** 매출 계정의 급증 원인을 파악하기 위해, `위험 평가` 탭에서 '매출'과 'E(실재성)'가 교차하는 셀을 클릭하여 가장 위험도가 높은 거래 내역을 드릴다운하고, 해당 내역을 CSV로 추출하여 감사 조서에 첨부한다."
+      - (임시 비활성화) `위험 평가` 탭 관련 시나리오는 현재 제거되어, 프로젝트 말미에 재도입 예정입니다.
         - **"박팀장은** 광고선전비 계정을 `AI 리포트`에서 분석하여, '신규 캠페인' 클러스터가 전기 대비 크게 증가했음을 확인하고, 해당 내용을 요약하여 월간 실적 보고 회의에 사용한다."
 
 ---
@@ -19,7 +20,7 @@
 2. **표준 입출력 계약 (Standard I/O Contracts)**: 모든 분석 모듈은 표준 데이터 구조인 **`LedgerFrame`*을 입력받고, 결과물로 표준 DTO(Data Transfer Object)인 **`ModuleResult`*를 반환해야 합니다. 이는 모듈의 독립성과 조합성을 보장합니다.
 3. **상태 없음 (Stateless Modules)**: `analysis/` 모듈은 내부 상태를 가지지 않는 순수 함수(Pure Function)처럼 동작해야 합니다. 동일 입력에 대해 항상 동일 출력을 보장하여 예측 가능성과 테스트 용이성을 높입니다.
 4. **중앙화된 외부 연동 (Centralized Services)**: LLM 호출, 외부 API(휴일 정보 등), 캐시 관리 등 모든 외부 의존성은 `services/` 계층에서만 처리합니다. 분석 로직의 순수성을 유지하기 위함입니다.
-5. **위험 중심 설계 (Risk-Driven Design)**: 모든 분석 결과(`EvidenceDetail`)는 최종적으로 재무제표 주장위험(**CEAVOP**)과 연결되어야 하며, 통계적 유의성과 재무적 중요성(**PM**)을 결합한 **통합 위험 점수**로 귀결되어야 합니다.
+5. **위험 중심 설계 (Risk-Driven Design)**: 모든 분석 결과(`EvidenceDetail`)는 최종적으로 통계적 유의성과 재무적 중요성(**PM**)을 결합한 **통합 위험 점수**로 귀결되어야 합니다.
 
 ---
 
@@ -78,7 +79,7 @@
 | **상관/사이클 분석** | `analysis/correlation.py` | 계정 간 월별 흐름의 상관관계(피어슨) 계산 및 히트맵 시각화. 계정명을 기반으로 표준 회계 사이클(R2C, P2P 등)을 자동 그룹화하고, 그룹 간 상관 붕괴/지연 탐지. | `LedgerFrame` | `ModuleResult` (상관 히트맵, 사이클 경고 테이블) | **[해석]** 상관 붕괴 원인 자연어 설명, **[추천]** 계정명 기반 사이클 그룹 제안 |
 | **시계열 예측** | `analysis/timeseries.py` | 계정별 월별 시계열 데이터에 최적 예측 모델(MoR: EMA/MA/ARIMA/Prophet)을 자동 적용. 최종 시점의 예측-실측 간 이탈(Error)을 계산하고 z-score, 위험 점수 산출. | `LedgerFrame` | `ModuleResult` (예측 결과 테이블, 예측 vs 실측 Figure, 예측 이탈 `EvidenceDetail` 리스트) | 없음 |
 | **이상 패턴 탐지** | `analysis/anomaly.py` | **1) 통계 기반**: Z-Score, Isolation Forest를 활용한 개별 거래 이상치 탐지. **2) 법칙 기반**: 벤포드 법칙(선행 자릿수 분석). **3) AI 기반**: 적요/거래처 텍스트 임베딩 및 클러스터링(HDBSCAN/KMeans)을 통한 패턴 그룹화 및 노이즈 탐지. | `LedgerFrame` | `ModuleResult` (이상 전표 테이블, SHAP 설명 그래프, 클러스터 품질 카드, 이상치 `EvidenceDetail` 리스트) | **[이름 부여]** 텍스트 임베딩 클러스터에 LLM으로 자동 이름 부여, **[해석]** SHAP 결과를 자연어로 설명 |
-| **위험 평가** | `analysis/assertion_risk.py` | 모든 분석 모듈에서 수집된 `EvidenceDetail`들을 취합. **(계정 × 주장위험)** 매트릭스에 통합 위험 점수(max 값)를 집계하여 히트맵으로 시각화. | `List[ModuleResult]` | `ModuleResult` (위험 히트맵 Figure, 드릴다운용 근거 테이블) | 없음 |
+| **위험 평가** | (임시 제거) | 프로젝트 말미 재도입 예정 | - | - | - |
 | **AI 리포트** | `services/llm.py`, `analysis/report.py` | **1) `report.py`**: 각 `ModuleResult`의 `summary`와 `evidences`를 종합하여 LLM에 전달할 최종 컨텍스트(RAG용)를 생성. **2) `llm.py`**: 생성된 컨텍스트를 받아 지정된 프롬프트와 스키마에 따라 최종 보고서(요약/주요 발견/위험/권고) 텍스트를 생성. | `List[ModuleResult]` | 최종 보고서 `string` | **[생성]** 종합 분석 결과를 바탕으로 최종 보고서 초안 작성 |
 
 ---
@@ -98,7 +99,7 @@ gl-analysis-system/
 │   ├── timeseries.py       # 시계열 예측 및 이탈 분석
 │   ├── anomaly.py          # 통계/AI 기반 이상 패턴 탐지
 │   ├── embedding.py        # 텍스트 임베딩 및 클러스터링 로직
-│   └── assertion_risk.py   # CEAVOP 주장위험 매트릭스 집계
+│   └── assertion_risk.py   # (⛔ 임시 제거 대상: 프로젝트 말미 재도입 예정)
 ├── services/
 │   ├── llm.py              # LLM(OpenAI) 호출 클라이언트 및 관련 유틸
 │   ├── cache.py            # 임베딩, 예측 결과 등 비용 큰 연산 캐시 관리

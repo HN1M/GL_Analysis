@@ -2,7 +2,6 @@ import pandas as pd
 from dataclasses import asdict
 from analysis.contracts import LedgerFrame
 from analysis.anomaly import run_anomaly_module
-from analysis.assertion_risk import build_matrix
 
 
 def _mini_df():
@@ -30,7 +29,5 @@ def test_snapshot_evidence_and_matrix_stable():
     } for e in mod.evidences]
     # 고정 기대값(리스크 가중치/PM이 바뀌면 실패하도록)
     assert any(s["acct"] == "매출" for s in snap)
-    # 매트릭스 스냅샷
-    mat, _ = build_matrix([mod])
-    assert 0.0 <= float(mat.values.max()) <= 1.0
+    # (위험평가/매트릭스 임시 제거: 관련 단언 삭제)
 

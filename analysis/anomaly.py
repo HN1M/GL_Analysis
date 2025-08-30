@@ -178,7 +178,7 @@ def run_anomaly_module(lf, target_accounts=None, topn=20, pm_value: Optional[flo
         a, f, k, score = _risk_from(za, amt, pm)
         ev_rows.append(EvidenceDetail(
             row_id=str(r.get('row_id','')),
-            reason=f"|Z|={za:.2f}",
+            reason=f"amt_z={z:+.2f}",
             anomaly_score=float(a),
             financial_impact=abs(amt),
             risk_score=float(score),
