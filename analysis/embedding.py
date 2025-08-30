@@ -3,8 +3,8 @@ import numpy as np
 import pandas as pd
 import time
 from typing import Dict, List, Optional, Tuple, Callable, Sequence, Any
-# --- KDMeans 기반 HDBSCAN 대체 사용 ---
-from analysis.kdmeans_shim import HDBSCAN   # (주의) 실제로는 KMeans 기반
+# --- KDMeans 기반 HDBSCAN 대체 사용(의미상 HDBSCAN과 유사 동작) ---
+from analysis.kdmeans_shim import HDBSCAN   # (주의) 내부적으로 KMeans 기반 구현
 _HAS_HDBSCAN = True
 # ---------------------------------------
 

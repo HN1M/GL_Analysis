@@ -77,8 +77,8 @@ def _strip_control(s: str) -> str:
     return re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", s or "")
 
 
-# --- NEW: ModuleResult 기반 컨텍스트 (경량 버전) ---
-def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: float) -> str:
+# --- ModuleResult 기반 컨텍스트(경량): 점진적 전환용 ---
+def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: float, topk: int = 20) -> str:
     """
     여러 ModuleResult에서 summary/상위 evidences를 뽑아 간단한 텍스트 컨텍스트를 생성.
     리포트가 점진적으로 ModuleResult만으로 돌아가도록 하는 전환용 경량 함수.
@@ -91,9 +91,13 @@ def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: f
             summ = getattr(m, "summary", None)
             if summ:
                 lines.append(f"- summary: {summ}")
-            evs = list(getattr(m, "evidences", []))[:20]
+            evs = list(getattr(m, "evidences", []))[:max(0, int(topk))]
             if evs:
-                lines.append("- evidences(top20):")
+                try:
+                    k = int(topk)
+                except Exception:
+                    k = 20
+                lines.append(f"- evidences(top{k}):")
                 for e in evs:
                     # 안전 접근
                     try:
@@ -121,6 +125,11 @@ def build_report_context_from_modules(modules: List["ModuleResult"], pm_value: f
         except Exception:
             continue
     return _strip_control("\n".join(lines)).strip()
+
+
+# Backward-compatible alias with explicit name used in app layer
+def generate_rag_context_from_modules(modules: List["ModuleResult"], pm_value: float, topk: int = 20) -> str:
+    return build_report_context_from_modules(modules, pm_value, topk=topk)
 
 
 def _safe_load(s: str):
@@ -293,23 +302,11 @@ def _format_from_json(obj: dict) -> str:
         key_tx_md = (kt_val or "").strip()
 
     conclusion = (obj.get("conclusion") or "").strip()
-    glossary_list = obj.get("glossary") or []
-
-    # 필수 용어 보강: Z-Score, 클러스터 노이즈(-1)
-    g_text = " ".join(map(str, glossary_list))
-    need_z = ("z-score" not in g_text.lower()) and ("Z-Score" not in g_text)
-    need_noise = ("클러스터 노이즈" not in g_text)
-    if need_z:
-        glossary_list.append("Z-Score: 표본의 값이 평균에서 몇 개의 표준편차만큼 떨어져 있는지 나타내는 지표(‘표준편차의 배수’). |Z|가 클수록 이례적임.")
-    if need_noise:
-        glossary_list.append("클러스터 노이즈(-1): 의미가 충분히 모이지 않아 자동으로 묶이지 않은 산발적 거래 묶음.")
-    glossary = "\n".join(f"- {str(x)}" for x in glossary_list)
 
     md = (
         f"**[요약]**\n{summary}\n\n"
         f"**[주요 거래]**\n{key_tx_md}\n\n"
-        f"**[결론]**\n{conclusion}\n\n"
-        f"**[용어 설명]**\n{glossary}"
+        f"**[결론]**\n{conclusion}"
     )
     return md
 
@@ -513,14 +510,9 @@ def run_offline_fallback_report(current_df: pd.DataFrame,
         "Z-Score가 큰 항목은 적요·거래처 등 근거 확인과 원인 파악이 필요합니다. "
         "주요 변동은 월별 추이/상관 분석과 함께 교차검토하는 것을 권장합니다."
     )
-    glossary = (
-        "- Z-Score: 표본 값이 평균에서 몇 표준편차만큼 떨어져 있는지 나타내는 지표(‘표준편차의 배수’). |Z|가 클수록 이례적.\n"
-        "- Key Item(KIT): 단일 항목 절대금액이 PM 이상인 전표."
-    )
     return (
         f"**[요약]**\n{summary}\n\n"
         f"**[주요 거래]**\n{key_tx}\n\n"
-        f"**[결론]**\n{conclusion}\n\n"
-        f"**[용어 설명]**\n{glossary}"
+        f"**[결론]**\n{conclusion}"
     )
 

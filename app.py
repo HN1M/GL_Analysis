@@ -15,7 +15,7 @@ import numpy as np
 import re
 from pathlib import Path
 from utils.helpers import find_column_by_keyword, add_provenance_columns, add_period_tag
-from analysis.integrity import analyze_reconciliation
+from analysis.integrity import analyze_reconciliation, run_integrity_module
 from analysis.contracts import LedgerFrame, ModuleResult
 from analysis.trend import create_monthly_trend_figure, run_trend_module
 from analysis.timeseries import (
@@ -31,7 +31,7 @@ from analysis.vendor import (
     create_vendor_detail_figure,
     run_vendor_module,
 )
-from analysis.report import build_report_context, run_final_analysis, build_methodology_note
+from analysis.report import run_final_analysis, build_methodology_note
 from analysis.embedding import (
     ensure_rich_embedding_text,
     perform_embedding_and_clustering,
@@ -102,6 +102,18 @@ st.markdown("---")
 for key in ['mapping_confirmed', 'analysis_done']:
     if key not in st.session_state:
         st.session_state[key] = False
+
+# --- NEW: 모듈 결과 수집용 컨테이너 ---
+if 'modules' not in st.session_state:
+    st.session_state['modules'] = {}
+
+def _push_module(mod: ModuleResult):
+    """ModuleResult를 세션에 수집(동명 모듈은 최신으로 교체)."""
+    try:
+        if mod and getattr(mod, "name", None):
+            st.session_state['modules'][str(mod.name)] = mod
+    except Exception:
+        pass
 
 
 # (removed) number_input 기반 대체 구현: 쉼표 미표시·키 충돌 유발 가능성 → 단일 구현으로 통일
@@ -357,14 +369,16 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🤖 AI 리포트"])
+                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🧠 분석 종합 대시보드"])
 
-                # [Removed] 대시보드 탭 전체
+                # (이전 버전) 대시보드 탭은 사용자 요청으로 제거됨
                 with tab_integrity:  # ...
                     st.header("데이터 무결성 및 흐름")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     st.subheader("1. 데이터 정합성 검증 결과")
-                    status, result_df = st.session_state.recon_status, st.session_state.recon_df
+                    mod = st.session_state.get('modules', {}).get('integrity')
+                    status = (getattr(mod, 'summary', {}) or {}).get('overall_status', 'Pass') if mod else 'Pass'
+                    result_df = (getattr(mod, 'tables', {}) or {}).get('reconciliation') if mod else st.session_state.get('recon_df')
                     if status == "Pass":
                         st.success("✅ 모든 계정의 데이터가 일치합니다.")
                     elif status == "Warning":
@@ -401,6 +415,7 @@ if uploaded_file is not None:
                             .tolist()
                         )
                         mod = run_trend_module(lf_use, accounts=accounts_codes)
+                        _push_module(mod)
                         for w in mod.warnings:
                             st.warning(w)
                         if mod.figures:
@@ -440,6 +455,7 @@ if uploaded_file is not None:
                             corr_threshold=float(corr_thr),
                             cycles_map=get_effective_cycles(),
                         )
+                        _push_module(cmod)
                         for w in cmod.warnings:
                             st.warning(w)
                         if cmod.figures:
@@ -488,6 +504,7 @@ if uploaded_file is not None:
                             min_amount=float(min_amount_vendor),
                             include_others=bool(include_others_vendor),
                         )
+                        _push_module(vmod)
                         if vmod.figures:
                             col1, col2 = st.columns(2)
                             with col1:
@@ -545,6 +562,7 @@ if uploaded_file is not None:
                         if pick:
                             codes = mdf[mdf['계정명'].isin(pick)]['계정코드'].astype(str).tolist()
                         amod = run_anomaly_module(lf_use, target_accounts=codes, topn=topn, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                        _push_module(amod)
                         for w in amod.warnings: st.warning(w)
                         if 'anomaly_top' in amod.tables:
                             _tbl = amod.tables['anomaly_top'].copy()
@@ -764,7 +782,34 @@ if uploaded_file is not None:
                 # ⚠️ 기존 tab5(위험평가) 블록 전체 삭제됨
                 
                 with tab_report:
-                    st.header("AI 리포트 및 채팅")
+                    st.header("🧠 분석 종합 대시보드")
+                    # --- Preview: modules session quick view ---
+                    modules_list_preview = list(st.session_state.get('modules', {}).values())
+                    with st.expander("🔎 모듈별 요약/증거 미리보기", expanded=False):
+                        if not modules_list_preview:
+                            st.info("모듈 결과가 비어 있습니다. 먼저 각 모듈을 실행하세요.")
+                        else:
+                            for mr in modules_list_preview:
+                                try:
+                                    st.subheader(f"• {getattr(mr, 'name', 'module')}")
+                                    if getattr(mr, 'summary', None):
+                                        st.json(mr.summary)
+                                    evs = list(getattr(mr, 'evidences', []))
+                                    if evs:
+                                        st.write("Evidence 샘플 (상위 3)")
+                                        for ev in evs[:3]:
+                                            try:
+                                                st.write(f"- reason={ev.reason} | risk={float(ev.risk_score):.2f} | amount={float(ev.financial_impact):,.0f}")
+                                            except Exception:
+                                                st.write("- (표시 실패)")
+                                    if getattr(mr, 'tables', None):
+                                        try: st.caption(f"tables: {list(mr.tables.keys())}")
+                                        except Exception: pass
+                                    if getattr(mr, 'figures', None):
+                                        try: st.caption(f"figures: {list(mr.figures.keys())}")
+                                        except Exception: pass
+                                except Exception:
+                                    st.caption("(미리보기 실패)")
                     # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능
                     LLM_OK = False
                     try:
@@ -776,7 +821,7 @@ if uploaded_file is not None:
                         st.info("🔌 OpenAI Key 없음: 오프라인 리포트 모드로 생성합니다. (클러스터/요약 LLM 미사용)")
                     rendered_report = False
 
-                    # === 모델/토큰 옵션 UI ===
+                    # === 모델/토큰/컨텍스트 옵션 UI ===
                     colm1, colm2, colm3 = st.columns([1,1,1])
                     with colm1:
                         llm_model_choice = st.selectbox(
@@ -789,7 +834,9 @@ if uploaded_file is not None:
                             help="실제 전송값은 모델 컨텍스트와 입력 토큰을 고려해 안전 클램프됩니다."
                         )
                     with colm3:
-                        st.caption("금액·포맷은 코드에서 강제됩니다.")
+                        ctx_topk = st.number_input("컨텍스트 Evidence Top-K(모듈별)", min_value=5, max_value=100, value=20, step=5)
+                        st.caption("요약/도표는 최소화하고 증거는 상위 Top-K만 사용합니다.")
+                        st.session_state['ctx_topk'] = int(ctx_topk)
 
                     # 선택한 모델/토큰을 세션에 저장하여 하단 호출부에서 실제 사용
                     st.session_state['llm_model'] = llm_model_choice
@@ -868,7 +915,7 @@ if uploaded_file is not None:
                                 df_cy_small = ensure_rich_embedding_text(df_cy_small)
                                 try:
                                     emb_client = LLMClient(model=st.session_state.get('llm_model')).client  # OpenAI 클라이언트 객체
-                                    # LLM naming is mandatory for the report
+                                    # 보고서 생성을 위해 LLM 기반 클러스터 네이밍을 필수로 요구
                                     df_clu, ok = perform_embedding_and_clustering(
                                         df_cy_small, emb_client,
                                         name_with_llm=True, must_name_with_llm=True,
@@ -878,7 +925,7 @@ if uploaded_file is not None:
                                         embed_texts_fn=get_or_embed_texts,
                                     )
                                     if ok:
-                                        # unify near-duplicate names using LLM
+                                        # 유사한 클러스터 이름을 LLM으로 통합
                                         from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
                                         df_clu, name_map = unify_cluster_names_with_llm(
                                             df_clu, emb_client,
@@ -902,7 +949,7 @@ if uploaded_file is not None:
                                                 .style.format({'발생액합계':'{:,.0f}'}),
                                             use_container_width=True
                                         )
-                                        # Quality telemetry
+                                        # 품질 지표(노이즈율·클러스터 수 등) 기록
                                         try:
                                             n = int(len(df_clu))
                                             noise_rate = float((df_clu['cluster_id'] == -1).mean()) if n else 0.0
@@ -921,7 +968,7 @@ if uploaded_file is not None:
                                             s.write(
                                                 f"    └ Model/UMAP: {model_used} | UMAP={'on' if umap_on else 'off'} | τ={float(st.session_state.get('rescue_tau', HDBSCAN_RESCUE_TAU)):.2f}"
                                             )
-                                            # Persist metrics for dashboard card
+                                            # 대시보드 카드용 품질 지표 저장
                                             st.session_state['cluster_quality'] = {
                                                 "N": n,
                                                 "noise_rate": noise_rate,
@@ -955,10 +1002,10 @@ if uploaded_file is not None:
                                                 df_py_clu = cluster_year(
                                                     df_py_small, emb_client, embed_texts_fn=get_or_embed_texts
                                                 )
-                                                # push back columns to df_py via row_id if available
+                                                # 가능한 경우 row_id 기준으로 PY 결과 컬럼을 df_py에 병합
                                                 if not df_py_clu.empty and 'row_id' in df_py.columns:
                                                     df_py = df_py.merge(df_py_clu, on='row_id', how='left', suffixes=("", "_pyclu"))
-                                                # alignment: map PY cluster IDs to CY
+                                                # 정렬: PY 클러스터를 CY 클러스터에 매핑
                                                 if 'cluster_id' in df_py_clu.columns:
                                                     mapping = align_yearly_clusters(df_clu, df_py_clu, sim_threshold=0.70)
                                                     # cluster_id → (aligned_cy_cluster, aligned_sim)
@@ -976,7 +1023,7 @@ if uploaded_file is not None:
                                                         df_py[['aligned_cy_cluster', 'aligned_sim']] = pd.DataFrame(pairs.tolist(), index=df_py.index)
                                                         # 이름은 CY의 이름으로 정렬(가능한 경우)
                                                         df_py['cluster_name'] = df_py['aligned_cy_cluster'].map(cy_id_to_name).fillna(df_py.get('cluster_name'))
-                                                # final unification over union of names — CY의 cluster_group 불변, PY는 표시명/그룹을 canonical로 정렬
+                                                # 최종 라벨 정합: 전체 이름 집합 기준으로 통합; CY의 cluster_group은 유지, PY는 canonical로 정렬
                                                 try:
                                                     all_names = pd.Series([], dtype=object)
                                                     if 'cluster_name' in df_cy.columns:
@@ -1041,29 +1088,84 @@ if uploaded_file is not None:
                             if not cl_ok:
                                 s.write("    └ 클러스터링 결과 없음 → 리포트에서 클러스터 섹션은 생략/축약됩니다.")
 
-                            # Step 4) 컨텍스트 생성 + 방법론 노트
-                            s.write("④ 컨텍스트 텍스트 구성…")
-                            # 4-A) 새 경로: ModuleResult 기반 (가능하면 우선 사용)
-                            try:
-                                from analysis.report_adapter import wrap_dfs_as_module_result
-                                from analysis.report import build_report_context_from_modules
-                                mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
-                                ctx_modules = build_report_context_from_modules(
-                                    [mr_ctx],
-                                    pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
-                                )
-                            except Exception:
-                                ctx_modules = ""
+                            # Step 4) 컨텍스트 생성(전 모듈 포함) + 방법론 노트
+                            s.write("④ 컨텍스트 텍스트 구성(전 모듈)…")
+                            from analysis.report_adapter import wrap_dfs_as_module_result
+                            from analysis.report import generate_rag_context_from_modules
+                            from analysis.integrity import run_integrity_module
+                            from analysis.timeseries import run_timeseries_module
 
-                            # 4-B) 구 경로: DF 기반(폴백)
-                            ctx_legacy = build_report_context(
-                                mdf, df_cy, df_py,
-                                account_codes=pick_codes,
-                                manual_context=manual_ctx,
-                                include_risk_summary=True,
-                                pm_value=float(st.session_state.get('pm_value', PM_DEFAULT))
+                            # (1) 세션 초기화 및 공통 값 준비
+                            st.session_state['modules'] = {}
+                            lf_use = _lf_by_scope()
+                            pm_use = float(st.session_state.get('pm_value', PM_DEFAULT))
+
+                            # (2) 주요 모듈 실행 및 수집
+                            if lf_use is not None:
+                                # 이상치
+                                try:
+                                    amod = run_anomaly_module(lf_use, target_accounts=pick_codes or None,
+                                                              topn=int(st.session_state.get('ctx_topk', 20)), pm_value=pm_use)
+                                    _push_module(amod)
+                                except Exception as _e:
+                                    st.warning(f"anomaly 모듈 실패: {_e}")
+                                # 추세(선택 계정 필요)
+                                try:
+                                    if pick_codes:
+                                        _push_module(run_trend_module(lf_use, accounts=pick_codes))
+                                except Exception as _e:
+                                    st.warning(f"trend 모듈 실패: {_e}")
+                                # 거래처
+                                try:
+                                    if pick_codes:
+                                        _push_module(run_vendor_module(lf_use, account_codes=pick_codes,
+                                                                       min_amount=0.0, include_others=True))
+                                except Exception as _e:
+                                    st.warning(f"vendor 모듈 실패: {_e}")
+                                # 상관(2개 이상일 때만)
+                                try:
+                                    if len(pick_codes) >= 2:
+                                        _push_module(run_correlation_module(lf_use, accounts=pick_codes,
+                                                                            corr_threshold=0.70,
+                                                                            cycles_map=get_effective_cycles()))
+                                except Exception as _e:
+                                    st.warning(f"correlation 모듈 실패: {_e}")
+                                # 정합성(레거시→DTO)
+                                try:
+                                    _push_module(run_integrity_module(ldf, mdf))
+                                except Exception as _e:
+                                    st.warning(f"integrity 모듈 실패: {_e}")
+                                # NEW: 시계열 포함(집계→DTO 래핑)
+                                try:
+                                    if not df_cy.empty:
+                                        ts = df_cy.copy()
+                                        ts["date"] = pd.to_datetime(ts["회계일자"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                                        ts["account"] = ts["계정코드"].astype(str)
+                                        ts["amount"] = ts.get("발생액", 0.0).astype(float)
+                                        ts_in = ts.groupby(["account","date"], as_index=False)["amount"].sum()
+                                        df_ts = run_timeseries_module(ts_in, account_col="account", date_col="date", amount_col="amount",
+                                                                      pm_value=pm_use, output="flow", make_balance=False)
+                                        summ_ts = {
+                                            "n_series": int(df_ts["account"].nunique()) if not df_ts.empty else 0,
+                                            "n_points": int(len(df_ts)),
+                                            "max_abs_z": float(df_ts["z"].abs().max()) if ("z" in df_ts.columns and not df_ts.empty) else 0.0,
+                                        }
+                                        _push_module(ModuleResult(name="timeseries", summary=summ_ts,
+                                                                  tables={"ts": df_ts}, figures={}, evidences=[], warnings=[]))
+                                except Exception as _e:
+                                    st.warning(f"timeseries 모듈 실패: {_e}")
+
+                            # (3) 레거시 DF도 어댑터로 함께 포함(경량 컨텍스트용)
+                            mr_ctx = wrap_dfs_as_module_result(df_cy, df_py, name="report_ctx")
+                            modules_list = list(st.session_state.get('modules', {}).values()) + [mr_ctx]
+                            # (4) 최종 컨텍스트 생성(Top-K 적용) — 신규 경로만 사용
+                            ctx = generate_rag_context_from_modules(
+                                modules_list,
+                                pm_value=pm_use,
+                                topk=int(st.session_state.get('ctx_topk', 20))
                             )
-                            ctx = (ctx_modules or ctx_legacy)
+
+                            # (상단 공통 미리보기로 대체)
                             note = build_methodology_note(report_accounts=pick_codes)
 
                             # Step 5) LLM 호출 전 점검(길이/토큰)
@@ -1201,7 +1303,7 @@ if uploaded_file is not None:
                             mime="application/zip",
                             key="zip_dl_cached"  # 고유 키(캐시 결과)
                         )
-                        # Cluster quality card (if available)
+                        # (가능 시) 클러스터 품질 카드 표시
                         cq = st.session_state.get("cluster_quality")
                         if cq:
                             st.markdown("---")

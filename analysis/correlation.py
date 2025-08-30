@@ -58,7 +58,9 @@ def _infer_cycle(account_name: str, cycles_map: Mapping[str, Sequence[str]]) -> 
 
 
 def map_accounts_to_cycles(accounts: List[str], *, cycles_map: Mapping[str, Sequence[str]]) -> Dict[str, Optional[str]]:
-    """배치 매핑: 계정명 리스트 → {계정명: 사이클(or None)}"""
+    """배치 매핑: 계정명 리스트 → {계정명: 사이클(or None)}.
+    cycles_map은 상위 레이어(app/services)에서 주입합니다.
+    """
     return {acc: _infer_cycle(acc, cycles_map) for acc in accounts}
 
 

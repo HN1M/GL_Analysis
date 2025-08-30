@@ -1,4 +1,9 @@
 import pandas as pd
+from typing import List, Dict, Any
+try:
+    from analysis.contracts import ModuleResult
+except Exception:
+    ModuleResult = None  # 타입 힌트/런타임 가드
 
 
 def analyze_reconciliation(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
@@ -40,3 +45,35 @@ def analyze_reconciliation(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
         })
     return overall_status, pd.DataFrame(results)
 
+
+# NEW: 표준 DTO(ModuleResult) 반환 래퍼
+def run_integrity_module(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
+    """
+    기존 analyze_reconciliation 결과를 표준 ModuleResult로 감쌉니다.
+    - summary: 상태/계정 수/Fail·Warning 건수/최대 차이
+    - tables: {"reconciliation": 결과 DF}
+    - evidences: (MVP 단계) 비움
+    """
+    status, df = analyze_reconciliation(ledger_df, master_df)
+    summary: Dict[str, Any] = {
+        "status": str(status),
+        "n_accounts": int(df["계정코드"].nunique()) if (df is not None and not df.empty and "계정코드" in df.columns) else 0,
+        "n_fail": int((df["상태"] == "Fail").sum()) if (df is not None and "상태" in df.columns) else 0,
+        "n_warn": int((df["상태"] == "Warning").sum()) if (df is not None and "상태" in df.columns) else 0,
+        "max_abs_diff": float(df["차이"].abs().max()) if (df is not None and not df.empty and "차이" in df.columns) else 0.0,
+    }
+    warnings: List[str] = [] if status == "Pass" else [f"정합성 상태: {status}"]
+    if ModuleResult is None:
+        # contracts 미가용 환경 안전가드
+        from typing import NamedTuple
+        class _MR(NamedTuple):
+            name: str; summary: Dict[str, Any]; tables: Dict[str, pd.DataFrame]; figures: Dict; evidences: List; warnings: List[str]
+        return _MR("integrity", summary, {"reconciliation": df}, {}, [], warnings)
+    return ModuleResult(
+        name="integrity",
+        summary=summary,
+        tables={"reconciliation": df},
+        figures={},
+        evidences=[],
+        warnings=warnings,
+    )
