@@ -39,6 +39,8 @@ from analysis.embedding import (
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
 from services.llm import LLMClient
+from services.cache import get_or_embed_texts
+from services.cycles_store import get_effective_cycles
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU
 try:
     from config import PM_DEFAULT
@@ -429,7 +431,12 @@ if uploaded_file is not None:
                         lf_use = _lf_by_scope()
                         mdf = st.session_state.master_df
                         codes = mdf[mdf['계정명'].isin(corr_accounts)]['계정코드'].astype(str).tolist()
-                        cmod = run_correlation_module(lf_use, accounts=codes, corr_threshold=float(corr_thr))
+                        cmod = run_correlation_module(
+                            lf_use,
+                            accounts=codes,
+                            corr_threshold=float(corr_thr),
+                            cycles_map=get_effective_cycles(),
+                        )
                         for w in cmod.warnings:
                             st.warning(w)
                         if cmod.figures:
@@ -858,11 +865,14 @@ if uploaded_file is not None:
                                         name_with_llm=True, must_name_with_llm=True,
                                         use_large=bool(st.session_state.get("use_large_embedding", False)),
                                         rescue_tau=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
+                                        embed_texts_fn=get_or_embed_texts,
                                     )
                                     if ok:
                                         # unify near-duplicate names using LLM
                                         from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
-                                        df_clu, name_map = unify_cluster_names_with_llm(df_clu, emb_client)
+                                        df_clu, name_map = unify_cluster_names_with_llm(
+                                            df_clu, emb_client, embed_texts_fn=get_or_embed_texts
+                                        )
                                         # 추가 LLM 라벨 통합(JSON 매핑 방식) — CY의 cluster_group은 유지
                                         try:
                                             raw_map = unify_cluster_labels_llm(df_clu['cluster_name'].dropna().unique().tolist(), emb_client)
@@ -930,7 +940,9 @@ if uploaded_file is not None:
                                                 if len(df_py_small) > max_rows:
                                                     df_py_small = df_py_small.sample(max_rows, random_state=42)
                                                     s.write(f"    └ PY 데이터가 많아 {max_rows:,}건으로 샘플링")
-                                                df_py_clu = cluster_year(df_py_small, emb_client)
+                                                df_py_clu = cluster_year(
+                                                    df_py_small, emb_client, embed_texts_fn=get_or_embed_texts
+                                                )
                                                 # push back columns to df_py via row_id if available
                                                 if not df_py_clu.empty and 'row_id' in df_py.columns:
                                                     df_py = df_py.merge(df_py_clu, on='row_id', how='left', suffixes=("", "_pyclu"))
@@ -990,11 +1002,13 @@ if uploaded_file is not None:
                                 df_py = ensure_rich_embedding_text(df_py)
                                 df_cy = perform_embedding_only(
                                     df_cy, client=emb_client2,
-                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                    use_large=bool(st.session_state.get("use_large_embedding", False)),
+                                    embed_texts_fn=get_or_embed_texts,
                                 )
                                 df_py = perform_embedding_only(
                                     df_py, client=emb_client2,
-                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                    use_large=bool(st.session_state.get("use_large_embedding", False)),
+                                    embed_texts_fn=get_or_embed_texts,
                                 )
                             elif not LLM_OK:
                                 s.write("③-1 근거 인용 임베딩: LLM 미가용 → 스킵")

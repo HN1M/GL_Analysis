@@ -2,18 +2,8 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Mapping, Sequence
 import re
-try:
-    from services.cycles_store import get_effective_cycles
-except Exception:
-    # 폴백: config의 STANDARD_ACCOUNTING_CYCLES 사용
-    try:
-        from config import STANDARD_ACCOUNTING_CYCLES as _STD_CYCLES
-    except Exception:
-        _STD_CYCLES = {}
-    def get_effective_cycles():  # type: ignore
-        return dict(_STD_CYCLES)
 from analysis.contracts import LedgerFrame, ModuleResult
 from utils.helpers import find_column_by_keyword
 
@@ -54,25 +44,32 @@ def _filter_accounts_for_corr(piv: pd.DataFrame, min_active_months: int = 6) -> 
     return piv.loc[keep], excluded
 
 
-def _infer_cycle(account_name: str) -> Optional[str]:
+def _infer_cycle(account_name: str, cycles_map: Mapping[str, Sequence[str]]) -> Optional[str]:
     """
     STANDARD_ACCOUNTING_CYCLES 기반의 간단한 키워드 매핑.
     가장 먼저 매칭되는 사이클을 반환(우선순위: dict 정의 순서).
     """
     name = str(account_name or "").lower()
-    for cycle, keywords in get_effective_cycles().items():
+    for cycle, keywords in cycles_map.items():
         for kw in keywords:
             if kw and re.search(re.escape(str(kw).lower()), name):
                 return cycle
     return None
 
 
-def map_accounts_to_cycles(accounts: List[str]) -> Dict[str, Optional[str]]:
+def map_accounts_to_cycles(accounts: List[str], *, cycles_map: Mapping[str, Sequence[str]]) -> Dict[str, Optional[str]]:
     """배치 매핑: 계정명 리스트 → {계정명: 사이클(or None)}"""
-    return {acc: _infer_cycle(acc) for acc in accounts}
+    return {acc: _infer_cycle(acc, cycles_map) for acc in accounts}
 
 
-def run_correlation_module(lf: LedgerFrame, accounts: List[str] | None = None, corr_threshold: float = 0.7, min_active_months: int = 6) -> ModuleResult:
+def run_correlation_module(
+    lf: LedgerFrame,
+    accounts: List[str] | None = None,
+    *,
+    corr_threshold: float = 0.7,
+    min_active_months: int = 6,
+    cycles_map: Mapping[str, Sequence[str]] | None = None,
+) -> ModuleResult:
     df = lf.df.copy()
     acct_col = find_column_by_keyword(df.columns, '계정코드')
     if not acct_col:

@@ -44,6 +44,8 @@ from analysis.embedding import (
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
 from services.llm import LLMClient
+from services.cache import get_or_embed_texts
+from services.cycles_store import get_effective_cycles
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU
 try:
     from config import PM_DEFAULT
@@ -99,7 +101,7 @@ def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "")
 
 # --- 3. UI 부분 ---
 st.set_page_config(page_title="AI 분석 시스템 v0.18", layout="wide")
-st.title("AI 분석 시스템 v0.18: 최종 개선 🏗️")
+st.title("훈's GL분석 시스템")
 st.markdown("---")
 
 for key in ['mapping_confirmed', 'analysis_done']:
@@ -434,7 +436,12 @@ if uploaded_file is not None:
                         lf_use = _lf_by_scope()
                         mdf = st.session_state.master_df
                         codes = mdf[mdf['계정명'].isin(corr_accounts)]['계정코드'].astype(str).tolist()
-                        cmod = run_correlation_module(lf_use, accounts=codes, corr_threshold=float(corr_thr))
+                        cmod = run_correlation_module(
+                            lf_use,
+                            accounts=codes,
+                            corr_threshold=float(corr_thr),
+                            cycles_map=get_effective_cycles(),
+                        )
                         for w in cmod.warnings:
                             st.warning(w)
                         if cmod.figures:
@@ -633,9 +640,6 @@ if uploaded_file is not None:
                         }), use_container_width=True)
 
                         # === 라인차트 ===
-                        # Need numpy for checking isnan/isfinite when rendering stats
-                                import numpy as np
-
                         st.markdown("#### 라인차트")
                         # 월별 집계에서 flow/balance 히스토리 구성
                         hist_base = use_ts.rename(columns={'amount':'flow'}).sort_values('date').copy()
@@ -712,11 +716,12 @@ if uploaded_file is not None:
                                             st.info(meta.get('reasoning'))
                                     except Exception:
                                         pass
-                                        with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                    # 4. Detailed Stats Expander
+                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
                                         st.write(stats.get("details"))
                                 elif stats and "error" in stats:
                                     st.warning(stats["error"])
-                            else:
+                                else:
                                     st.info("차트를 생성할 데이터가 부족합니다.")
 
                             if is_bs:
@@ -865,11 +870,14 @@ if uploaded_file is not None:
                                         name_with_llm=True, must_name_with_llm=True,
                                         use_large=bool(st.session_state.get("use_large_embedding", False)),
                                         rescue_tau=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
+                                        embed_texts_fn=get_or_embed_texts,
                                     )
                                     if ok:
                                         # unify near-duplicate names using LLM
                                         from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
-                                        df_clu, name_map = unify_cluster_names_with_llm(df_clu, emb_client)
+                                        df_clu, name_map = unify_cluster_names_with_llm(
+                                            df_clu, emb_client, embed_texts_fn=get_or_embed_texts
+                                        )
                                         # 추가 LLM 라벨 통합(JSON 매핑 방식) — CY의 cluster_group은 유지
                                         try:
                                             raw_map = unify_cluster_labels_llm(df_clu['cluster_name'].dropna().unique().tolist(), emb_client)
@@ -937,7 +945,9 @@ if uploaded_file is not None:
                                                 if len(df_py_small) > max_rows:
                                                     df_py_small = df_py_small.sample(max_rows, random_state=42)
                                                     s.write(f"    └ PY 데이터가 많아 {max_rows:,}건으로 샘플링")
-                                                df_py_clu = cluster_year(df_py_small, emb_client)
+                                                df_py_clu = cluster_year(
+                                                    df_py_small, emb_client, embed_texts_fn=get_or_embed_texts
+                                                )
                                                 # push back columns to df_py via row_id if available
                                                 if not df_py_clu.empty and 'row_id' in df_py.columns:
                                                     df_py = df_py.merge(df_py_clu, on='row_id', how='left', suffixes=("", "_pyclu"))
@@ -997,11 +1007,13 @@ if uploaded_file is not None:
                                 df_py = ensure_rich_embedding_text(df_py)
                                 df_cy = perform_embedding_only(
                                     df_cy, client=emb_client2,
-                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                    use_large=bool(st.session_state.get("use_large_embedding", False)),
+                                    embed_texts_fn=get_or_embed_texts,
                                 )
                                 df_py = perform_embedding_only(
                                     df_py, client=emb_client2,
-                                    use_large=bool(st.session_state.get("use_large_embedding", False))
+                                    use_large=bool(st.session_state.get("use_large_embedding", False)),
+                                    embed_texts_fn=get_or_embed_texts,
                                 )
                             elif not LLM_OK:
                                 s.write("③-1 근거 인용 임베딩: LLM 미가용 → 스킵")
@@ -1664,18 +1676,8 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 import plotly.express as px
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Tuple, Optional, Mapping, Sequence
 import re
-try:
-    from services.cycles_store import get_effective_cycles
-except Exception:
-    # 폴백: config의 STANDARD_ACCOUNTING_CYCLES 사용
-    try:
-        from config import STANDARD_ACCOUNTING_CYCLES as _STD_CYCLES
-    except Exception:
-        _STD_CYCLES = {}
-    def get_effective_cycles():  # type: ignore
-        return dict(_STD_CYCLES)
 from analysis.contracts import LedgerFrame, ModuleResult
 from utils.helpers import find_column_by_keyword
 
@@ -1716,25 +1718,32 @@ def _filter_accounts_for_corr(piv: pd.DataFrame, min_active_months: int = 6) -> 
     return piv.loc[keep], excluded
 
 
-def _infer_cycle(account_name: str) -> Optional[str]:
+def _infer_cycle(account_name: str, cycles_map: Mapping[str, Sequence[str]]) -> Optional[str]:
     """
     STANDARD_ACCOUNTING_CYCLES 기반의 간단한 키워드 매핑.
     가장 먼저 매칭되는 사이클을 반환(우선순위: dict 정의 순서).
     """
     name = str(account_name or "").lower()
-    for cycle, keywords in get_effective_cycles().items():
+    for cycle, keywords in cycles_map.items():
         for kw in keywords:
             if kw and re.search(re.escape(str(kw).lower()), name):
                 return cycle
     return None
 
 
-def map_accounts_to_cycles(accounts: List[str]) -> Dict[str, Optional[str]]:
+def map_accounts_to_cycles(accounts: List[str], *, cycles_map: Mapping[str, Sequence[str]]) -> Dict[str, Optional[str]]:
     """배치 매핑: 계정명 리스트 → {계정명: 사이클(or None)}"""
-    return {acc: _infer_cycle(acc) for acc in accounts}
+    return {acc: _infer_cycle(acc, cycles_map) for acc in accounts}
 
 
-def run_correlation_module(lf: LedgerFrame, accounts: List[str] | None = None, corr_threshold: float = 0.7, min_active_months: int = 6) -> ModuleResult:
+def run_correlation_module(
+    lf: LedgerFrame,
+    accounts: List[str] | None = None,
+    *,
+    corr_threshold: float = 0.7,
+    min_active_months: int = 6,
+    cycles_map: Mapping[str, Sequence[str]] | None = None,
+) -> ModuleResult:
     df = lf.df.copy()
     acct_col = find_column_by_keyword(df.columns, '계정코드')
     if not acct_col:
@@ -1799,14 +1808,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable, Sequence, Any
 # --- KDMeans 기반 HDBSCAN 대체 사용 ---
 from analysis.kdmeans_shim import HDBSCAN   # (주의) 실제로는 KMeans 기반
 _HAS_HDBSCAN = True
 # ---------------------------------------
 
 from utils.helpers import find_column_by_keyword
-from services.cache import get_or_embed_texts
 from config import (
     EMB_MODEL_SMALL, EMB_MODEL_LARGE, EMB_USE_LARGE_DEFAULT,
     UMAP_APPLY_THRESHOLD, UMAP_N_COMPONENTS, UMAP_N_NEIGHBORS, UMAP_MIN_DIST,
@@ -1821,7 +1829,9 @@ EMB_TRUNC_CHARS = 2000
 
 
 def embed_texts_batched(
-    texts: List[str],
+    texts: Sequence[str],
+    *,
+    embed_texts_fn: Callable[..., Any],
     client,
     model: str,
     batch_size: int = EMB_BATCH_SIZE,
@@ -1829,17 +1839,19 @@ def embed_texts_batched(
     max_retry: int = EMB_MAX_RETRY,
     trunc_chars: int = EMB_TRUNC_CHARS,
 ) -> Dict[str, List[float]]:
-    """배치 임베딩 유틸. {원본문자열: 벡터} 반환."""
+    """배치 임베딩 유틸. {원본문자열: 벡터} 반환.
+    services 레이어에 직접 의존하지 않고, 호출자가 임베딩 함수(embed_texts_fn)를 주입한다.
+    """
     if not texts:
         return {}
-    san = []
+    san: List[str] = []
     for t in texts:
         s = t if isinstance(t, str) else str(t)
         san.append(s[:trunc_chars] if trunc_chars and len(s) > trunc_chars else s)
 
-    # Use persistent cache (SQLite per model)
-    return get_or_embed_texts(
-        san, client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
+    # 호출자로부터 주입받은 함수 사용(예: services.cache.get_or_embed_texts)
+    return embed_texts_fn(
+        san, client=client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
     )
 
 
@@ -1900,21 +1912,38 @@ def ensure_rich_embedding_text(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def perform_embedding_only(df: pd.DataFrame, client, text_col: str = 'embedding_text', *, use_large: bool|None=None) -> pd.DataFrame:
+def perform_embedding_only(
+    df: pd.DataFrame,
+    client,
+    text_col: str = 'embedding_text',
+    *,
+    use_large: bool|None=None,
+    embed_texts_fn: Callable[..., Any],
+) -> pd.DataFrame:
     """df[text_col]을 배치 임베딩해서 df['vector'] 추가"""
     if df.empty: return df
     if text_col not in df.columns:
         raise ValueError(f"임베딩 텍스트 컬럼 '{text_col}'이 없습니다.")
     uniq = df[text_col].astype(str).unique().tolist()
     model = pick_emb_model(use_large=use_large)
-    mapping = embed_texts_batched(uniq, client, model=model)
+    mapping = embed_texts_batched(
+        uniq,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=model,
+    )
     df = df.copy()
     df['vector'] = df[text_col].astype(str).map(mapping)
     # 누락 보강 시도
     if df['vector'].isna().any():
         miss = df.loc[df['vector'].isna(), text_col].astype(str).unique().tolist()
         if miss:
-            fb = embed_texts_batched(miss, client, model=model)
+            fb = embed_texts_batched(
+                miss,
+                embed_texts_fn=embed_texts_fn,
+                client=client,
+                model=model,
+            )
             df.loc[df['vector'].isna(), 'vector'] = df.loc[df['vector'].isna(), text_col].astype(str).map(fb)
     return df
 
@@ -2024,6 +2053,7 @@ def perform_embedding_and_clustering(
     use_large: bool|None = None,
     rescue_tau: float = HDBSCAN_RESCUE_TAU,
     umap_enabled: bool|None = None,   # None => use config threshold
+    embed_texts_fn: Callable[..., Any],
 ):
     """
     Embedding + (optional UMAP) + L2-normalized Euclidean HDBSCAN + noise rescue + (LLM naming).
@@ -2033,7 +2063,12 @@ def perform_embedding_and_clustering(
     df = ensure_embedding_text(df.copy())
     uniq = df['embedding_text'].astype(str).unique().tolist()
     model = pick_emb_model(use_large=use_large)
-    mapping = embed_texts_batched(uniq, client, model=model)
+    mapping = embed_texts_batched(
+        uniq,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=model,
+    )
     df['vector'] = df['embedding_text'].astype(str).map(mapping)
     # keep only valid vectors
     mask = df['vector'].apply(lambda v: isinstance(v, (list, tuple)) and len(v) > 0)
@@ -2124,6 +2159,8 @@ def unify_cluster_names_with_llm(
     sim_threshold: float = 0.90,
     emb_model: str = EMB_MODEL_SMALL,
     llm_model: str = "gpt-4o-mini",
+    *,
+    embed_texts_fn: Callable[..., Any],
 ):
     """
     Collapse clusters with effectively identical names.
@@ -2148,7 +2185,12 @@ def unify_cluster_names_with_llm(
         return base, {}
 
     # Embedding prefilter
-    name2vec = embed_texts_batched(names, client, model=emb_model)
+    name2vec = embed_texts_batched(
+        names,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=emb_model,
+    )
     ordered = [n for n in names if n in name2vec]
     vecs = [name2vec[n] for n in ordered]
     S = _cosine_sim_matrix(vecs)
@@ -2288,7 +2330,7 @@ def unify_cluster_labels_llm(names, client) -> dict:
 
 
 # --- NEW: Yearly clustering helpers and alignment ---
-def cluster_year(df: pd.DataFrame, client) -> pd.DataFrame:
+def cluster_year(df: pd.DataFrame, client, *, embed_texts_fn: Callable[..., Any]) -> pd.DataFrame:
     """
     당기/전기 등 입력 df에 대해 풍부 임베딩 텍스트를 보장하고 HDBSCAN+LLM 네이밍을 실행.
     반환: ['row_id','cluster_id','cluster_name','cluster_prob','vector']가 포함된 DataFrame(부분집합 가능).
@@ -2298,7 +2340,13 @@ def cluster_year(df: pd.DataFrame, client) -> pd.DataFrame:
         return pd.DataFrame()
     from .embedding import ensure_rich_embedding_text, perform_embedding_and_clustering
     df_in = ensure_rich_embedding_text(df.copy())
-    df_out, ok = perform_embedding_and_clustering(df_in, client, name_with_llm=True, must_name_with_llm=False)
+    df_out, ok = perform_embedding_and_clustering(
+        df_in,
+        client,
+        name_with_llm=True,
+        must_name_with_llm=False,
+        embed_texts_fn=embed_texts_fn,
+    )
     if not ok or df_out is None:
         return pd.DataFrame()
     keep = [c for c in ['row_id','cluster_id','cluster_name','cluster_prob','vector'] if c in df_out.columns]
@@ -2927,7 +2975,7 @@ class HDBSCAN:
 
 from __future__ import annotations
 import pandas as pd
-from typing import List
+from typing import List, Callable, Optional, Any
 from .evidence import (
     build_current_cluster_block,
     # build_previous_projection_block,  # 파일 하단 로컬 정의 사용
@@ -3201,10 +3249,6 @@ def build_methodology_note(report_accounts=None) -> str:
     return "\n".join(lines)
 
 
-# LLM 보고서는 서비스 계층(stub) 사용 권장
-from services.llm import LLMClient
-
-
 def _format_from_json(obj: dict) -> str:
     """
     단순 스키마(JSON) → 최종 마크다운.
@@ -3302,7 +3346,14 @@ def build_previous_projection_block(current_df: pd.DataFrame, previous_df: pd.Da
     return "\n".join(lines)
 
 
-def run_final_analysis(context: str, account_codes: list[str], *, model: str | None = None, max_tokens: int | None = 16000) -> str:
+def run_final_analysis(
+    context: str,
+    account_codes: list[str],
+    *,
+    model: str | None = None,
+    max_tokens: int | None = 16000,
+    generate_fn: Optional[Callable[..., str]] = None,
+) -> str:
     system = (
         "You are a CPA. Do all hidden reasoning internally and output ONLY the JSON object in the EXACT schema below. "
         "Language: Korean (ko-KR) for every natural-language value.\n"
@@ -3344,13 +3395,14 @@ def run_final_analysis(context: str, account_codes: list[str], *, model: str | N
         }
     }
 
-    llm = LLMClient()
     max_retries = 2
     last_err = None
 
     for attempt in range(max_retries + 1):
         try:
-            raw = llm.generate(
+            if generate_fn is None:
+                raise RuntimeError("generate_fn not provided (LLM dependency must be injected)")
+            raw = generate_fn(
                 system=system, user=user, model=model,
                 max_tokens=max_tokens, tools=[tool_schema], force_json=False
             )
@@ -5187,6 +5239,30 @@ def test_zscore_and_risk_monotonic():
     b2 = _risk_from(1.0, amount=150_000, pm=100_000)[-1]
     assert a2 > a1
     assert b2 > b1
+
+
+
+
+
+==============================
+📄 FILE: tests/test_architecture_imports.py
+==============================
+
+from pathlib import Path
+
+FORBIDDEN = ("from services", "import services")
+
+
+def test_analysis_not_import_services():
+    bad = []
+    for p in Path("analysis").rglob("*.py"):
+        try:
+            t = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if any(x in t for x in FORBIDDEN):
+            bad.append(str(p))
+    assert not bad, f"analysis must not import services: {bad}"
 
 
 

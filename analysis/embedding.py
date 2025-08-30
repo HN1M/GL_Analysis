@@ -2,14 +2,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Callable, Sequence, Any
 # --- KDMeans 기반 HDBSCAN 대체 사용 ---
 from analysis.kdmeans_shim import HDBSCAN   # (주의) 실제로는 KMeans 기반
 _HAS_HDBSCAN = True
 # ---------------------------------------
 
 from utils.helpers import find_column_by_keyword
-from services.cache import get_or_embed_texts
 from config import (
     EMB_MODEL_SMALL, EMB_MODEL_LARGE, EMB_USE_LARGE_DEFAULT,
     UMAP_APPLY_THRESHOLD, UMAP_N_COMPONENTS, UMAP_N_NEIGHBORS, UMAP_MIN_DIST,
@@ -24,7 +23,9 @@ EMB_TRUNC_CHARS = 2000
 
 
 def embed_texts_batched(
-    texts: List[str],
+    texts: Sequence[str],
+    *,
+    embed_texts_fn: Callable[..., Any],
     client,
     model: str,
     batch_size: int = EMB_BATCH_SIZE,
@@ -32,17 +33,19 @@ def embed_texts_batched(
     max_retry: int = EMB_MAX_RETRY,
     trunc_chars: int = EMB_TRUNC_CHARS,
 ) -> Dict[str, List[float]]:
-    """배치 임베딩 유틸. {원본문자열: 벡터} 반환."""
+    """배치 임베딩 유틸. {원본문자열: 벡터} 반환.
+    services 레이어에 직접 의존하지 않고, 호출자가 임베딩 함수(embed_texts_fn)를 주입한다.
+    """
     if not texts:
         return {}
-    san = []
+    san: List[str] = []
     for t in texts:
         s = t if isinstance(t, str) else str(t)
         san.append(s[:trunc_chars] if trunc_chars and len(s) > trunc_chars else s)
 
-    # Use persistent cache (SQLite per model)
-    return get_or_embed_texts(
-        san, client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
+    # 호출자로부터 주입받은 함수 사용(예: services.cache.get_or_embed_texts)
+    return embed_texts_fn(
+        san, client=client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
     )
 
 
@@ -103,21 +106,38 @@ def ensure_rich_embedding_text(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def perform_embedding_only(df: pd.DataFrame, client, text_col: str = 'embedding_text', *, use_large: bool|None=None) -> pd.DataFrame:
+def perform_embedding_only(
+    df: pd.DataFrame,
+    client,
+    text_col: str = 'embedding_text',
+    *,
+    use_large: bool|None=None,
+    embed_texts_fn: Callable[..., Any],
+) -> pd.DataFrame:
     """df[text_col]을 배치 임베딩해서 df['vector'] 추가"""
     if df.empty: return df
     if text_col not in df.columns:
         raise ValueError(f"임베딩 텍스트 컬럼 '{text_col}'이 없습니다.")
     uniq = df[text_col].astype(str).unique().tolist()
     model = pick_emb_model(use_large=use_large)
-    mapping = embed_texts_batched(uniq, client, model=model)
+    mapping = embed_texts_batched(
+        uniq,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=model,
+    )
     df = df.copy()
     df['vector'] = df[text_col].astype(str).map(mapping)
     # 누락 보강 시도
     if df['vector'].isna().any():
         miss = df.loc[df['vector'].isna(), text_col].astype(str).unique().tolist()
         if miss:
-            fb = embed_texts_batched(miss, client, model=model)
+            fb = embed_texts_batched(
+                miss,
+                embed_texts_fn=embed_texts_fn,
+                client=client,
+                model=model,
+            )
             df.loc[df['vector'].isna(), 'vector'] = df.loc[df['vector'].isna(), text_col].astype(str).map(fb)
     return df
 
@@ -227,6 +247,7 @@ def perform_embedding_and_clustering(
     use_large: bool|None = None,
     rescue_tau: float = HDBSCAN_RESCUE_TAU,
     umap_enabled: bool|None = None,   # None => use config threshold
+    embed_texts_fn: Callable[..., Any],
 ):
     """
     Embedding + (optional UMAP) + L2-normalized Euclidean HDBSCAN + noise rescue + (LLM naming).
@@ -236,7 +257,12 @@ def perform_embedding_and_clustering(
     df = ensure_embedding_text(df.copy())
     uniq = df['embedding_text'].astype(str).unique().tolist()
     model = pick_emb_model(use_large=use_large)
-    mapping = embed_texts_batched(uniq, client, model=model)
+    mapping = embed_texts_batched(
+        uniq,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=model,
+    )
     df['vector'] = df['embedding_text'].astype(str).map(mapping)
     # keep only valid vectors
     mask = df['vector'].apply(lambda v: isinstance(v, (list, tuple)) and len(v) > 0)
@@ -327,6 +353,8 @@ def unify_cluster_names_with_llm(
     sim_threshold: float = 0.90,
     emb_model: str = EMB_MODEL_SMALL,
     llm_model: str = "gpt-4o-mini",
+    *,
+    embed_texts_fn: Callable[..., Any],
 ):
     """
     Collapse clusters with effectively identical names.
@@ -351,7 +379,12 @@ def unify_cluster_names_with_llm(
         return base, {}
 
     # Embedding prefilter
-    name2vec = embed_texts_batched(names, client, model=emb_model)
+    name2vec = embed_texts_batched(
+        names,
+        embed_texts_fn=embed_texts_fn,
+        client=client,
+        model=emb_model,
+    )
     ordered = [n for n in names if n in name2vec]
     vecs = [name2vec[n] for n in ordered]
     S = _cosine_sim_matrix(vecs)
@@ -491,7 +524,7 @@ def unify_cluster_labels_llm(names, client) -> dict:
 
 
 # --- NEW: Yearly clustering helpers and alignment ---
-def cluster_year(df: pd.DataFrame, client) -> pd.DataFrame:
+def cluster_year(df: pd.DataFrame, client, *, embed_texts_fn: Callable[..., Any]) -> pd.DataFrame:
     """
     당기/전기 등 입력 df에 대해 풍부 임베딩 텍스트를 보장하고 HDBSCAN+LLM 네이밍을 실행.
     반환: ['row_id','cluster_id','cluster_name','cluster_prob','vector']가 포함된 DataFrame(부분집합 가능).
@@ -501,7 +534,13 @@ def cluster_year(df: pd.DataFrame, client) -> pd.DataFrame:
         return pd.DataFrame()
     from .embedding import ensure_rich_embedding_text, perform_embedding_and_clustering
     df_in = ensure_rich_embedding_text(df.copy())
-    df_out, ok = perform_embedding_and_clustering(df_in, client, name_with_llm=True, must_name_with_llm=False)
+    df_out, ok = perform_embedding_and_clustering(
+        df_in,
+        client,
+        name_with_llm=True,
+        must_name_with_llm=False,
+        embed_texts_fn=embed_texts_fn,
+    )
     if not ok or df_out is None:
         return pd.DataFrame()
     keep = [c for c in ['row_id','cluster_id','cluster_name','cluster_prob','vector'] if c in df_out.columns]

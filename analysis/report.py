@@ -1,6 +1,6 @@
 from __future__ import annotations
 import pandas as pd
-from typing import List
+from typing import List, Callable, Optional, Any
 from .evidence import (
     build_current_cluster_block,
     # build_previous_projection_block,  # 파일 하단 로컬 정의 사용
@@ -274,10 +274,6 @@ def build_methodology_note(report_accounts=None) -> str:
     return "\n".join(lines)
 
 
-# LLM 보고서는 서비스 계층(stub) 사용 권장
-from services.llm import LLMClient
-
-
 def _format_from_json(obj: dict) -> str:
     """
     단순 스키마(JSON) → 최종 마크다운.
@@ -375,7 +371,14 @@ def build_previous_projection_block(current_df: pd.DataFrame, previous_df: pd.Da
     return "\n".join(lines)
 
 
-def run_final_analysis(context: str, account_codes: list[str], *, model: str | None = None, max_tokens: int | None = 16000) -> str:
+def run_final_analysis(
+    context: str,
+    account_codes: list[str],
+    *,
+    model: str | None = None,
+    max_tokens: int | None = 16000,
+    generate_fn: Optional[Callable[..., str]] = None,
+) -> str:
     system = (
         "You are a CPA. Do all hidden reasoning internally and output ONLY the JSON object in the EXACT schema below. "
         "Language: Korean (ko-KR) for every natural-language value.\n"
@@ -417,13 +420,14 @@ def run_final_analysis(context: str, account_codes: list[str], *, model: str | N
         }
     }
 
-    llm = LLMClient()
     max_retries = 2
     last_err = None
 
     for attempt in range(max_retries + 1):
         try:
-            raw = llm.generate(
+            if generate_fn is None:
+                raise RuntimeError("generate_fn not provided (LLM dependency must be injected)")
+            raw = generate_fn(
                 system=system, user=user, model=model,
                 max_tokens=max_tokens, tools=[tool_schema], force_json=False
             )
