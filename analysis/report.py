@@ -188,17 +188,17 @@ def generate_rag_context(master_df: pd.DataFrame, current_df: pd.DataFrame, prev
     sec_top5_py = build_zscore_top5_block_for_py(previous_df, current_df, topn=5)
     sec_ts = build_timeseries_summary_block(current_df)
 
-    # --- NEW: 위험 매트릭스 요약(선택)
-    sec_risk = ""
-    if include_risk_summary:
-        try:
-            sec_risk = _build_risk_matrix_section(current_df, pm_value=pm_value)
-        except Exception:
-            sec_risk = ""
+    # --- 위험 매트릭스 요약 제거(경영진주장/매트릭스 비활성화) ---
+    # sec_risk = ""
+    # if include_risk_summary:
+    #     try:
+    #         sec_risk = _build_risk_matrix_section(current_df, pm_value=pm_value)
+    #     except Exception:
+    #         sec_risk = ""
 
     parts = [sec_info, sec_cur, sec_prev, sec_ts, sec_top5_cy, sec_top5_py]
-    if sec_risk:
-        parts.insert(2, sec_risk)  # 정보→(위험)→클러스터 순
+    # if sec_risk:
+    #     parts.insert(2, sec_risk)  # 정보→(위험)→클러스터 순
     return "\n".join(parts)
 
 
@@ -256,43 +256,10 @@ def build_timeseries_summary_block(current_df: pd.DataFrame, topn: int = 5) -> s
     return "\n".join(lines)
 
 
-def _build_risk_matrix_section(current_df: pd.DataFrame, pm_value: float | None = None) -> str:
-    """
-    당기 데이터로 이상치 모듈을 한 번 돌려 (계정×주장) 위험 매트릭스 상위 셀을 요약.
-    """
-    from .anomaly import run_anomaly_module
-    from .assertion_risk import build_matrix
-    from config import PM_DEFAULT
-
-    if current_df is None or current_df.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (데이터 없음)"
-
-    # 간이 LedgerFrame 구성
-    from analysis.contracts import LedgerFrame
-    lf = LedgerFrame(df=current_df.copy(), meta={})
-
-    pm = float(pm_value) if pm_value is not None else float(PM_DEFAULT)
-    mod = run_anomaly_module(lf, target_accounts=None, topn=200, pm_value=pm)
-    mat, _ = build_matrix([mod])
-    if mat.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (생성된 Evidence 없음)"
-
-    # 상위 10 셀 추출
-    flat = (
-        mat.stack()
-          .rename("risk")
-          .reset_index()
-          .sort_values("risk", ascending=False)
-    )
-    top = flat[flat["risk"] > 0].head(10)
-    if top.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (유의미한 위험값 없음)"
-
-    lines = ["\n\n## 위험 매트릭스 요약 (상위 10)"]
-    for _, r in top.iterrows():
-        acct = str(r["level_0"]); asrt = str(r["level_1"]); val = float(r["risk"])
-        lines.append(f"- {acct} × {asrt} ⇒ {val:.2f}")
-    return "\n".join(lines)
+def _build_risk_matrix_section(*_args, **_kwargs) -> str:
+    # [Removed] CEAVOP/위험 매트릭스 섹션은 2025-08-30 기준 비활성화.
+    # 재도입 전까지 빈 문자열을 반환하여 호출부를 깨지 않음.
+    return ""
 
 
 def build_methodology_note(report_accounts=None) -> str:

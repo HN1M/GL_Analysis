@@ -352,24 +352,10 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab1, tab2, tab3, tab4, tab_ts, tab_report = st.tabs(["📈 대시보드", "🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열/예측", "🤖 AI 리포트"])
+                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🤖 AI 리포트"])
 
-                with tab1:  # ...
-                    st.header("핵심 요약 대시보드")
-                    recon_status, ledger_df_res = st.session_state.recon_status, st.session_state.ledger_df
-                    st.subheader("데이터 현황")
-                    kpi_cols = st.columns(3)
-                    kpi_cols[0].metric("총 거래 건수", f"{len(ledger_df_res):,} 건")
-                    kpi_cols[1].metric("총 거래 금액 (절대값)", f"{st.session_state.ledger_df['거래금액_절대값'].sum():,.0f} 원")
-                    kpi_cols[2].metric("분석 대상 계정 수", f"{ledger_df_res['계정코드'].nunique()} 개")
-                    st.subheader("데이터 무결성")
-                    if recon_status == 'Pass':
-                        st.success("✅ 데이터 정합성: 모든 계정 일치")
-                    elif recon_status == 'Warning':
-                        st.warning("⚠️ 데이터 정합성: 일부 계정에서 사소한 차이 발견")
-                    else:
-                        st.error("🚨 데이터 정합성: 일부 계정에서 중대한 차이 발견")
-                with tab2:  # ...
+                # [Removed] 대시보드 탭 전체
+                with tab_integrity:  # ...
                     st.header("데이터 무결성 및 흐름")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     st.subheader("1. 데이터 정합성 검증 결과")
@@ -459,7 +445,7 @@ if uploaded_file is not None:
                             with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
                                 st.dataframe(cmod.tables['excluded_accounts'], use_container_width=True)
 
-                with tab3:
+                with tab_vendor:
                     st.header("거래처 심층 분석")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
 
@@ -534,8 +520,8 @@ if uploaded_file is not None:
                     else:
                         st.info("분석할 거래처 데이터가 없습니다.")
 
-                with tab4:
-                    st.header("이상 패턴 탐지 (v1: Z-Score)")
+                with tab_anomaly:
+                    st.header("이상 패턴 탐지")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     mdf = st.session_state.master_df
                     acct_names = mdf['계정명'].unique()
@@ -558,35 +544,34 @@ if uploaded_file is not None:
                             st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True, key="anomaly_hist")
 
                 with tab_ts:
-                    st.header("시계열 예측(MoR) — 마지막 포인트 요약 + 라인차트")
+                    st.header("시계열 예측")
                     with st.expander("🧭 해석 가이드", expanded=False):
                         st.markdown(
                             """
-### 📌 이 화면은 이렇게 읽으세요
-- **σ(시그마) 윈도우**: 최근 *k=6개월* 잔차(실측−예측)의 표준편차로 오차를 표준화합니다. 데이터가 짧으면 시작~현재까지의 **expanding σ**를 사용합니다.  
-- **z(표준화 지수)**: `z = (실측 − 예측) / σ` → |z|≈2는 **이례적(주의)**, |z|≈3은 **매우 이례적**입니다.  
-- **risk(0~1)** = `min(1, 0.5·|z|/3 + 0.3·PM대비 + 0.2·KIT)`  
+### 용어
+- **z(표준화 지수)**: `z = (실측 − 예측) / σ`  
+  - 월별 예측 잔차(실측-예측)를 표준화한 지수입니다. **이상 패턴 탐지의 Z-Score와 다른 개념입니다.**
+  - |z|≈2는 **이례적**, |z|≈3은 **매우 이례적**입니다.  
+- **σ(표준편차) 집계**: 최근 *k=6개월* 잔차의 표준편차로 표준화합니다. 데이터가 짧으면 시작~현재까지의 **expanding σ**를 사용합니다.  
+- **위험도(0~1)** = `min(1, 0.5·|z|/3 + 0.3·PM대비 + 0.2·KIT)`  
   - PM대비 = `min(1, |실측−예측| / PM)`,  **KIT** = PM 초과 여부(True/False)
 - **Flow / Balance**: *Flow*는 **월 발생액(Δ잔액)**, *Balance*는 **월말 잔액**입니다. *(BS 계정은 Balance 기준도 병행 계산합니다.)*
+- **정상성**: 시계열의 평균/분산이 시간에 따라 **안 변함**(ARIMA가 특히 선호).
+- **MAE**: 평균 절대 오차(원 단위). **작을수록 정확**.
+- **MAPE**: 상대 오차(%). **규모 다른 계정 비교**에 유용.
+- **AIC/BIC**: 모델 복잡도까지 고려한 **정보량 지표**. **작을수록 우수**.
 
-### 📈 차트 읽기
+### 차트 읽기
 - 실선=실측, 점선=예측(**MoR**: EMA/MA/ARIMA/Prophet 중 자동 선택)  
-- 회색 점선: **연(굵게)** / **분기(얇게)** 경계선, 붉은 점선: **PM 기준선**  
-- 🔴 **조건 마커**: ***|z| ≥ 3 AND |실측−예측| ≥ PM*** 인 지점만 표기됩니다. (마우스오버: error, z, PM대비)
+- 회색 점선: **연(굵게)** / **분기(얇게)** 경계선, 붉은 점선: **PM 기준선**
 
-### 🔎 사용한 예측모델
+### 사용한 예측모델
 - **MA(이동평균)**: 최근 *n*개월 **단순 평균**. **짧은 데이터/변동 완만**할 때 안정적.
 - **EMA(지수이동평균)**: **최근값 가중** 평균. **최근 추세 반영**이 필요할 때 유리.
 - **ARIMA(p,d,q)**: **자기상관** 기반. **계절성이 약(또는 제거 가능)**하고 **데이터가 충분**할 때 강함.
 - **Prophet**: **연/분기 계절성·휴일효과**가 뚜렷할 때 적합(이상치에 비교적 견고).
 
 > :blue[**모델은 계정×기준(Flow/Balance)별로 교차검증 오차(MAPE/MAE)와 (가능하면) 정보량(AIC/BIC)을 종합해 자동 선택됩니다.**]
-
-### ℹ️ 용어(아주 간단히)
-- **정상성**: 시계열의 평균/분산이 시간에 따라 **안 변함**(ARIMA가 특히 선호).
-- **MAE**: 평균 절대 오차(원 단위). **작을수록 정확**.
-- **MAPE**: 상대 오차(%). **규모 다른 계정 비교**에 유용.
-- **AIC/BIC**: 모델 복잡도까지 고려한 **정보량 지표**. **작을수록 우수**.
 """
                         )
                     # 모델 가용 배지(디버깅 겸 사용자 안내)
@@ -605,10 +590,18 @@ if uploaded_file is not None:
                                .reset_index().rename(columns={'계정명':'account','연월':'date','거래금액':'amount'}))
                     pick_accounts_ts = st.multiselect("대상 계정", sorted(agg['account'].unique()), default=[], key="ts_accounts")
                     use_ts = agg if not pick_accounts_ts else agg[agg['account'].isin(pick_accounts_ts)]
-                    from analysis.timeseries import run_timeseries_module as _ts_run
-                    res = _ts_run(use_ts.rename(columns={'account':'account','date':'date','amount':'amount'}),
-                                  account_col='account', date_col='date', amount_col='amount',
-                                  pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                    # BS 여부를 반영해 balance 기준도 병행 계산
+                    try:
+                        bs_map = st.session_state.master_df[['계정명','BS/PL']].drop_duplicates()
+                        _bs_flag = bs_map.set_index('계정명')['BS/PL'].map(lambda x: str(x).upper()== 'BS').to_dict()
+                    except Exception:
+                        _bs_flag = {}
+                    work_ts = use_ts.copy()
+                    work_ts['is_bs'] = work_ts['account'].map(lambda name: bool(_bs_flag.get(str(name), False)))
+                    from analysis.timeseries import run_timeseries_module_with_flag as _ts_run_flag
+                    res = _ts_run_flag(work_ts.rename(columns={'account':'account','date':'date','amount':'amount','is_bs':'is_bs'}),
+                                       account_col='account', date_col='date', amount_col='amount', is_bs_col='is_bs',
+                                       pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
                     if not res.empty:
                         out = res.copy()
                         out = out.rename(columns={'account':'계정'})
@@ -629,7 +622,7 @@ if uploaded_file is not None:
                             'z': '표준화지수(z)',
                             'risk': '위험도(0~1)'
                         })
-                        st.caption("MoR(최적 모델) 기준. BS는 balance 기준도 병행 계산합니다(요약 테이블에는 flow가 기본).")
+                        st.caption("MoR(최적 모델) 기준. BS 계정은 balance 기준도 함께 표시합니다.")
                         st.dataframe(_disp.style.format({
                             '실제(월 합계)':'{:,.0f}', '예측(월 합계)':'{:,.0f}', '차이(실제-예측)':'{:,.0f}', '표준화지수(z)':'{:+.2f}', '위험도(0~1)':'{:.2f}'
                         }), use_container_width=True)
@@ -687,29 +680,7 @@ if uploaded_file is not None:
                                     fig = add_period_guides(fig, ins['date'])
                                 except Exception:
                                     pass
-                            # --- 조건 마커: |z|≥3 AND |error|≥PM ---
-                            try:
-                                import numpy as np
-                                pm_here = float(st.session_state.get("pm_value", PM_DEFAULT))
-                                resid = (ins["actual"] - ins["predicted"]).astype(float)
-                                roll_sd = resid.rolling(6, min_periods=2).std().replace({0.0: np.nan})
-                                z_series = resid / roll_sd
-                                cond = z_series.abs().ge(3) & resid.abs().ge(pm_here)
-                                if cond.any():
-                                    fig.add_trace(go.Scatter(
-                                        x=ins.loc[cond, "date"],
-                                        y=ins.loc[cond, "actual"],
-                                        mode="markers",
-                                        name="flag (|z|≥3 & |err|≥PM)",
-                                        marker=dict(size=8, color="red", symbol="circle-open"),
-                                        hovertext=[
-                                            f"error={e:,.0f}원<br>z={z:+.2f}<br>PM대비={min(1, abs(e)/pm_here):.2f}"
-                                            for e, z in zip(resid[cond], z_series[cond])
-                                        ],
-                                        hoverinfo="text"
-                                    ))
-                            except Exception:
-                                pass
+                            # (삭제됨) 조건 마커: |z|≥3 AND |error|≥PM
                             # === 상태 배지(계절성/정상성/데이터 길이) ===
                             try:
                                 y_vals = _np.asarray(ins['actual'].values, dtype=float)
@@ -3261,17 +3232,17 @@ def generate_rag_context(master_df: pd.DataFrame, current_df: pd.DataFrame, prev
     sec_top5_py = build_zscore_top5_block_for_py(previous_df, current_df, topn=5)
     sec_ts = build_timeseries_summary_block(current_df)
 
-    # --- NEW: 위험 매트릭스 요약(선택)
-    sec_risk = ""
-    if include_risk_summary:
-        try:
-            sec_risk = _build_risk_matrix_section(current_df, pm_value=pm_value)
-        except Exception:
-            sec_risk = ""
+    # --- 위험 매트릭스 요약 제거(경영진주장/매트릭스 비활성화) ---
+    # sec_risk = ""
+    # if include_risk_summary:
+    #     try:
+    #         sec_risk = _build_risk_matrix_section(current_df, pm_value=pm_value)
+    #     except Exception:
+    #         sec_risk = ""
 
     parts = [sec_info, sec_cur, sec_prev, sec_ts, sec_top5_cy, sec_top5_py]
-    if sec_risk:
-        parts.insert(2, sec_risk)  # 정보→(위험)→클러스터 순
+    # if sec_risk:
+    #     parts.insert(2, sec_risk)  # 정보→(위험)→클러스터 순
     return "\n".join(parts)
 
 
@@ -3329,43 +3300,10 @@ def build_timeseries_summary_block(current_df: pd.DataFrame, topn: int = 5) -> s
     return "\n".join(lines)
 
 
-def _build_risk_matrix_section(current_df: pd.DataFrame, pm_value: float | None = None) -> str:
-    """
-    당기 데이터로 이상치 모듈을 한 번 돌려 (계정×주장) 위험 매트릭스 상위 셀을 요약.
-    """
-    from .anomaly import run_anomaly_module
-    from .assertion_risk import build_matrix
-    from config import PM_DEFAULT
-
-    if current_df is None or current_df.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (데이터 없음)"
-
-    # 간이 LedgerFrame 구성
-    from analysis.contracts import LedgerFrame
-    lf = LedgerFrame(df=current_df.copy(), meta={})
-
-    pm = float(pm_value) if pm_value is not None else float(PM_DEFAULT)
-    mod = run_anomaly_module(lf, target_accounts=None, topn=200, pm_value=pm)
-    mat, _ = build_matrix([mod])
-    if mat.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (생성된 Evidence 없음)"
-
-    # 상위 10 셀 추출
-    flat = (
-        mat.stack()
-          .rename("risk")
-          .reset_index()
-          .sort_values("risk", ascending=False)
-    )
-    top = flat[flat["risk"] > 0].head(10)
-    if top.empty:
-        return "\n\n## 위험 매트릭스 요약\n- (유의미한 위험값 없음)"
-
-    lines = ["\n\n## 위험 매트릭스 요약 (상위 10)"]
-    for _, r in top.iterrows():
-        acct = str(r["level_0"]); asrt = str(r["level_1"]); val = float(r["risk"])
-        lines.append(f"- {acct} × {asrt} ⇒ {val:.2f}")
-    return "\n".join(lines)
+def _build_risk_matrix_section(*_args, **_kwargs) -> str:
+    # [Removed] CEAVOP/위험 매트릭스 섹션은 2025-08-30 기준 비활성화.
+    # 재도입 전까지 빈 문자열을 반환하여 호출부를 깨지 않음.
+    return ""
 
 
 def build_methodology_note(report_accounts=None) -> str:

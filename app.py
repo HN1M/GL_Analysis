@@ -347,24 +347,10 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab1, tab2, tab3, tab4, tab_ts, tab_report = st.tabs(["📈 대시보드", "🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🤖 AI 리포트"])
+                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🤖 AI 리포트"])
 
-                with tab1:  # ...
-                    st.header("핵심 요약 대시보드")
-                    recon_status, ledger_df_res = st.session_state.recon_status, st.session_state.ledger_df
-                    st.subheader("데이터 현황")
-                    kpi_cols = st.columns(3)
-                    kpi_cols[0].metric("총 거래 건수", f"{len(ledger_df_res):,} 건")
-                    kpi_cols[1].metric("총 거래 금액 (절대값)", f"{st.session_state.ledger_df['거래금액_절대값'].sum():,.0f} 원")
-                    kpi_cols[2].metric("분석 대상 계정 수", f"{ledger_df_res['계정코드'].nunique()} 개")
-                    st.subheader("데이터 무결성")
-                    if recon_status == 'Pass':
-                        st.success("✅ 데이터 정합성: 모든 계정 일치")
-                    elif recon_status == 'Warning':
-                        st.warning("⚠️ 데이터 정합성: 일부 계정에서 사소한 차이 발견")
-                    else:
-                        st.error("🚨 데이터 정합성: 일부 계정에서 중대한 차이 발견")
-                with tab2:  # ...
+                # [Removed] 대시보드 탭 전체
+                with tab_integrity:  # ...
                     st.header("데이터 무결성 및 흐름")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     st.subheader("1. 데이터 정합성 검증 결과")
@@ -454,7 +440,7 @@ if uploaded_file is not None:
                             with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
                                 st.dataframe(cmod.tables['excluded_accounts'], use_container_width=True)
 
-                with tab3:
+                with tab_vendor:
                     st.header("거래처 심층 분석")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
 
@@ -529,7 +515,7 @@ if uploaded_file is not None:
                     else:
                         st.info("분석할 거래처 데이터가 없습니다.")
 
-                with tab4:
+                with tab_anomaly:
                     st.header("이상 패턴 탐지")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     mdf = st.session_state.master_df
