@@ -23,6 +23,11 @@ from utils.helpers import find_column_by_keyword, add_provenance_columns, add_pe
 from analysis.integrity import analyze_reconciliation
 from analysis.contracts import LedgerFrame, ModuleResult
 from analysis.trend import create_monthly_trend_figure, run_trend_module
+from analysis.timeseries import (
+    model_registry,
+    run_timeseries_module_with_flag,
+    create_timeseries_figure
+)
 from analysis.anomaly import run_anomaly_module, compute_amount_columns
 from analysis.correlation import run_correlation_module
 from analysis.vendor import (
@@ -576,7 +581,7 @@ if uploaded_file is not None:
                         )
                     # 모델 가용 배지(디버깅 겸 사용자 안내)
                     try:
-                        from analysis.timeseries import model_registry
+                        # model_registry is imported at the top
                         _reg = model_registry()
                         st.caption(f"지원 모델: EMA ✓ · MA ✓ · ARIMA {'✓' if _reg['arima'] else '—'} · Prophet {'✓' if _reg['prophet'] else '—'}")
                     except Exception:
@@ -598,8 +603,8 @@ if uploaded_file is not None:
                         _bs_flag = {}
                     work_ts = use_ts.copy()
                     work_ts['is_bs'] = work_ts['account'].map(lambda name: bool(_bs_flag.get(str(name), False)))
-                    from analysis.timeseries import run_timeseries_module_with_flag as _ts_run_flag
-                    res = _ts_run_flag(work_ts.rename(columns={'account':'account','date':'date','amount':'amount','is_bs':'is_bs'}),
+
+                    res = run_timeseries_module_with_flag(work_ts,
                                        account_col='account', date_col='date', amount_col='amount', is_bs_col='is_bs',
                                        pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
                     if not res.empty:
@@ -628,130 +633,8 @@ if uploaded_file is not None:
                         }), use_container_width=True)
 
                         # === 라인차트 ===
-                        import numpy as _np
-                        import plotly.graph_objects as go
-                        from analysis.timeseries import insample_predict_df
-                        from utils.viz import add_time_dividers, add_period_guides
-                        # (계절성/정상성 진단 유틸)
-                        def _adf_stationary(y_vals):
-                            try:
-                                from statsmodels.tsa.stattools import adfuller
-                                p = float(adfuller(_np.asarray(y_vals, dtype=float))[1])
-                                return (p < 0.05, p)   # True=정상성 확보
-                            except Exception:
-                                # 간단 폴백: 차분 분산이 원분산보다 충분히 작으면(추세 제거 효과) 정상성으로 간주
-                                y = _np.asarray(y_vals, dtype=float)
-                                if len(y) < 6: return (False, _np.nan)
-                                return (_np.nanstd(_np.diff(y)) < 0.9 * _np.nanstd(y), _np.nan)
-
-                        def _has_seasonality_safe(y_vals):
-                            try:
-                                from analysis.timeseries import _has_seasonality as _hs
-                                import pandas as _pd
-                                return bool(_hs(_pd.Series(y_vals)))
-                            except Exception:
-                                return False
-
-                        def _make_ts_fig_with_stats(df_hist: pd.DataFrame, measure: str, title: str):
-                            vcol = 'flow' if measure == 'flow' else 'balance'
-                            base = df_hist[['date', vcol]].rename(columns={vcol: 'val'}).sort_values('date')
-                            ins = insample_predict_df(
-                                base.rename(columns={'val': vcol}),
-                                value_col=vcol,
-                                measure=measure,
-                                pm_value=float(st.session_state.get("pm_value", PM_DEFAULT))
-                            )
-                            if ins.empty:
-                                return None, None
-                            fig = go.Figure()
-                            fig.add_trace(go.Scatter(x=ins['date'], y=ins['actual'], mode='lines', name='actual'))
-                            fig.add_trace(go.Scatter(x=ins['date'], y=ins['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
-                            fig.update_layout(title=title, xaxis_title='month', yaxis_title='원')
-                            fig.update_yaxes(tickformat=",.0f", separatethousands=True, ticksuffix="")
-                            try:
-                                fig = add_materiality_threshold(fig, float(st.session_state.get("pm_value", PM_DEFAULT)))
-                            except Exception:
-                                pass
-                            # 연/분기 구분선 추가 (토글 가능)
-                            show_dividers = st.toggle("연/분기 구분선 표시", value=True, key=f"ts_dividers_toggle_{title}")
-                            if show_dividers:
-                                try:
-                                    # paper 높이 전체를 관통하는 가이드
-                                    fig = add_period_guides(fig, ins['date'])
-                                except Exception:
-                                    pass
-                            # (삭제됨) 조건 마커: |z|≥3 AND |error|≥PM
-                            # === 상태 배지(계절성/정상성/데이터 길이) ===
-                            try:
-                                y_vals = _np.asarray(ins['actual'].values, dtype=float)
-                                n_months = int(_np.isfinite(y_vals).sum())
-                                seas = _has_seasonality_safe(y_vals)
-                                stat_ok, pval = _adf_stationary(y_vals)
-                                b1, b2, b3 = st.columns(3)
-                                b1.caption(f"계절성: {'강함' if seas else '약함'}")
-                                b2.caption(f"정상성: {'확보' if stat_ok else '미확보'}" + ("" if _np.isnan(pval) else f" (p={pval:.3f})"))
-                                b3.caption(f"데이터: {n_months}개월 — {'충분' if n_months>=12 else '짧음'}")
-                            except Exception:
-                                pass
-                            # --- 추가: 모델 선택 이유 카드(간단 진단) ---
-                            from utils.helpers import model_reason_text
-                            mae  = float(_np.mean(_np.abs(ins['actual'] - ins['predicted'])))
-                            mape = float(_np.mean(_np.where(ins['actual']!=0, _np.abs((ins['actual']-ins['predicted'])/ins['actual'])*100, 0)))
-                            aic = bic = _np.nan
-                            if str(ins['model'].iloc[-1]).upper() == "ARIMA":
-                                try:
-                                    from analysis.timeseries import _fit_arima
-                                    _y = ins['actual'].reset_index(drop=True)
-                                    _ar = _fit_arima(_y)
-                                    aic = float(getattr(_ar, "aic", _np.nan))
-                                    bic = float(getattr(_ar, "bic", _np.nan))
-                                except Exception:
-                                    pass
-                            y_vals2 = _np.asarray(ins['actual'].values, dtype=float)
-                            n_points = int(_np.isfinite(y_vals2).sum())
-                            recent_trend = False
-                            if n_points >= 6:
-                                x = _np.arange(n_points)
-                                slope = _np.polyfit(x, y_vals2, 1)[0]
-                                recent_trend = abs(slope) > 0.3 * (y_vals2.std() + 1e-9)
-                            try:
-                                import numpy as np
-                                ac = np.abs(np.fft.rfft((y_vals2 - y_vals2.mean())))
-                                core = ac[2:] if ac.size>2 else ac
-                                seas_strength = float(core.max()/(core.mean()+1e-9)) if core.size else 0.0
-                                seas_strength = max(0.0, min((seas_strength-1.0)/4.0, 1.0))
-                            except Exception:
-                                seas_strength = 0.0
-                            diagnostics = {
-                                "n_points": n_points,
-                                "seasonality_strength": seas_strength,
-                                "stationary": bool(stat_ok),
-                                "recent_trend": bool(recent_trend),
-                                "cv_mape_rank": 1,
-                                "mae": mae, "mape": mape, "aic": aic, "bic": bic,
-                            }
-                            best_model_name = str(ins['model'].iloc[-1])
-                            train_months    = int(ins['train_months'].iloc[-1])
-                            span_txt        = str(ins['data_span'].iloc[-1])
-                            sigma_window    = int(ins['sigma_win'].iloc[-1])
-                            st.caption(
-                                f"선택모델: **{best_model_name}** · 학습기간: {span_txt} ({train_months}개월) · "
-                                f"σ윈도우: {sigma_window}개월 · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}% · "
-                                f"AIC: {aic if _np.isfinite(aic) else '—'} · BIC: {bic if _np.isfinite(bic) else '—'}"
-                            )
-                            try:
-                                st.info(model_reason_text(best_model_name, diagnostics))
-                            except Exception:
-                                pass
-
-                            stats = {
-                                "모델": best_model_name,
-                                "학습기간(월)": train_months,
-                                "데이터 구간": span_txt,
-                                "σ 윈도우(최근)": sigma_window,
-                                "CV(K)": 3,
-                            }
-                            return fig, stats
+                        # Need numpy for checking isnan/isfinite when rendering stats
+                        import numpy as np 
 
                         st.markdown("#### 라인차트")
                         # 월별 집계에서 flow/balance 히스토리 구성
@@ -781,37 +664,7 @@ if uploaded_file is not None:
                         if cur_hist.empty:
                             st.info("선택 계정의 월별 데이터가 없습니다.")
                         else:
-                            # 학습 구간/개월수/선택 모델 표기
-                            try:
-                                s = cur_hist.sort_values('date')
-                                span = f"{s['date'].min():%Y-%m} ~ {s['date'].max():%Y-%m}"
-                                n_mon = int(s['date'].dt.to_period('M').nunique())
-                                # 선택 모델 (flow/balance)
-                                used_model_flow = None
-                                used_model_balance = None
-                                try:
-                                    used_model_flow = res.loc[(res['account']==sel_acc)&(res['measure']=='flow'), 'model'].iloc[-1]
-                                except Exception:
-                                    pass
-                                try:
-                                    used_model_balance = res.loc[(res['account']==sel_acc)&(res['measure']=='balance'), 'model'].iloc[-1]
-                                except Exception:
-                                    pass
-                                # 간단 통계 (MAE/MAPE는 insample_df에서 직접 계산 가능)
-                                from analysis.timeseries import insample_predict_df
-                                _tmp_flow = insample_predict_df(cur_hist[['date','flow']], 'flow', 'flow')
-                                if not (_tmp_flow is None or _tmp_flow.empty):
-                                    import numpy as _np
-                                    mae = float(_np.mean(_np.abs(_tmp_flow['actual'] - _tmp_flow['predicted'])))
-                                    mape = float(_np.mean(_np.where(_tmp_flow['actual'] != 0, _np.abs((_tmp_flow['actual'] - _tmp_flow['predicted']) / _tmp_flow['actual']) * 100.0, 0.0)))
-                                else:
-                                    mae = 0.0; mape = 0.0
-                                sigma_window = 6
-                                st.caption(
-                                    f"학습기간: {span} ({n_mon}개월) · σ윈도우: {sigma_window}개월 · 선택모델(Flow/Balance): {used_model_flow or '-'} / {used_model_balance or '-'} · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}%"
-                                )
-                            except Exception:
-                                used_model_flow = None; used_model_balance = None
+                            # (기존 학습/모델 표기 로직 제거 — create_timeseries_figure에서 메타와 지표 제공)
 
                             # 대변계정(부채·자본·수익)인 경우 그래프 부호 반전
                             try:
@@ -827,47 +680,77 @@ if uploaded_file is not None:
                             except Exception:
                                 pass
 
+                            # UI: 공통 옵션 설정
+                            show_dividers = st.toggle("연/분기 구분선 표시", value=True, key=f"ts_dividers_toggle_{sel_acc}")
+                            pm_val_current = float(st.session_state.get("pm_value", PM_DEFAULT))
+
+                            # Helper to render figure and stats
+                            def _render_fig_and_stats(fig, stats, key_suffix):
+                                if fig and stats:
+                                    try:
+                                        diag = stats.get("diagnostics", {})
+                                        pval = diag.get("p_value")
+                                        b1, b2, b3 = st.columns(3)
+                                        b1.caption(f"계절성: {'강함' if diag.get('seasonality') else '약함'}")
+                                        ptxt = "" if pval is None or (isinstance(pval, float) and np.isnan(pval)) else f" (p={pval:.3f})"
+                                        b2.caption(f"정상성: {'확보' if diag.get('stationary') else '미확보'}" + ptxt)
+                                        b3.caption(f"데이터: {diag.get('n_months')}개월 — {'충분' if not diag.get('is_short') else '짧음'}")
+                                    except Exception:
+                                        pass
+                                    st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_{key_suffix}")
+                                    try:
+                                        meta = stats.get("metadata", {})
+                                        metrics = stats.get("metrics", {})
+                                        mae, mape = metrics.get('mae'), metrics.get('mape')
+                                        aic, bic = metrics.get('aic'), metrics.get('bic')
+                                        st.caption(
+                                            f"선택모델: **{meta.get('model')}** · 학습기간: {meta.get('data_span')} ({meta.get('train_months')}개월) · "
+                                            f"σ윈도우: {meta.get('sigma_window')}개월 · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}% · "
+                                            f"AIC: {aic if isinstance(aic, float) and np.isfinite(aic) else '—'} · BIC: {bic if isinstance(bic, float) and np.isfinite(bic) else '—'}"
+                                        )
+                                        if meta.get('reasoning'):
+                                            st.info(meta.get('reasoning'))
+                                    except Exception:
+                                        pass
+                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
+                                        st.write(stats.get("details"))
+                                elif stats and "error" in stats:
+                                    st.warning(stats["error"])
+                                else:
+                                    st.info("차트를 생성할 데이터가 부족합니다.")
+
                             if is_bs:
                                 pair = st.toggle("쌍차트 보기(Flow+Balance)", value=True)
                                 if pair:
                                     c1, c2 = st.columns(2)
-                                    # 모델 표기(Flow/Balance)
-                                    try:
-                                        st.caption(f"선택 모델(MoR): Flow={used_model_flow or '-'} · Balance={used_model_balance or '-'}")
-                                    except Exception:
-                                        pass
                                     with c1:
-                                        f1, st1 = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                        if f1:
-                                            st.plotly_chart(f1, use_container_width=True, key=f"ts_line_{sel_acc}_flow")
-                                            with st.expander("이 차트의 통계 설정 보기", expanded=False):
-                                                st.write(st1)
+                                        f1, st1 = create_timeseries_figure(
+                                            cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
+                                            pm_value=pm_val_current,
+                                            show_dividers=show_dividers
+                                        )
+                                        _render_fig_and_stats(f1, st1, "flow")
                                     with c2:
-                                        f2, st2 = _make_ts_fig_with_stats(cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)")
-                                        if f2:
-                                            st.plotly_chart(f2, use_container_width=True, key=f"ts_line_{sel_acc}_balance")
-                                            with st.expander("이 차트의 통계 설정 보기", expanded=False):
-                                                st.write(st2)
+                                        f2, st2 = create_timeseries_figure(
+                                            cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)",
+                                            pm_value=pm_val_current,
+                                            show_dividers=show_dividers
+                                        )
+                                        _render_fig_and_stats(f2, st2, "balance")
                                 else:
-                                    fig, stx = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                    try:
-                                        st.caption(f"기준: Flow · 선택 모델(MoR): {used_model_flow or '-'}")
-                                    except Exception:
-                                        pass
-                                    if fig:
-                                        st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_flow_single")
-                                        with st.expander("이 차트의 통계 설정 보기", expanded=False):
-                                            st.write(stx)
+                                    fig, stx = create_timeseries_figure(
+                                        cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
+                                        pm_value=pm_val_current,
+                                        show_dividers=show_dividers
+                                    )
+                                    _render_fig_and_stats(fig, stx, "flow_single")
                             else:
-                                fig, stx = _make_ts_fig_with_stats(cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)")
-                                try:
-                                    st.caption(f"기준: Flow · 선택 모델(MoR): {used_model_flow or '-'}")
-                                except Exception:
-                                    pass
-                                if fig:
-                                    st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_flow_only")
-                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
-                                        st.write(stx)
+                                fig, stx = create_timeseries_figure(
+                                    cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
+                                    pm_value=pm_val_current,
+                                    show_dividers=show_dividers
+                                )
+                                _render_fig_and_stats(fig, stx, "flow_only")
 
                         # (삭제됨) 막대 대조 UI — 오류 원인 경로 차단
 
@@ -3622,6 +3505,23 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 import math
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+
+# Attempt to import visualization and helper utilities (assuming they exist in the project structure)
+try:
+    from utils.viz import add_period_guides, add_materiality_threshold
+except ImportError:
+    # Fallbacks if utils.viz is not found
+    def add_period_guides(fig, dates):
+        return fig
+    def add_materiality_threshold(fig, threshold):
+        return fig
+try:
+    from utils.helpers import model_reason_text
+except ImportError:
+    # Fallback if utils.helpers is not found
+    def model_reason_text(model_name, diagnostics):
+        return f"Model {model_name} was selected based on cross-validation metrics."
 
 # -------- Optional config / anomaly imports with safe fallbacks --------
 try:
@@ -4168,6 +4068,197 @@ def validation_summary(
         "last_z": z,
         "pm_ratio": pm_ratio,
     }
+
+
+# ========================================================================
+# ============= NEW: Functions moved from app.py for Refactoring =========
+# ========================================================================
+
+# ----------------------- TS Diagnostics (moved from app.py) -------------
+
+def _adf_stationary(y_vals: np.ndarray) -> Tuple[bool, float]:
+    """ADF test for stationarity."""
+    try:
+        from statsmodels.tsa.stattools import adfuller
+        y_clean = np.asarray(y_vals, dtype=float)
+        # ADF requires finite values and sufficient length
+        if not np.all(np.isfinite(y_clean)) or len(y_clean) < 3:  # ADF needs at least 3 points for default settings
+            return (False, np.nan)
+
+        p = float(adfuller(y_clean)[1])
+        return (p < 0.05, p)  # True=정상성 확보
+    except Exception:
+        # 간단 폴백 (원본 로직 유지)
+        y = np.asarray(y_vals, dtype=float)
+        if len(y) < 6:
+            return (False, np.nan)
+
+        std_orig = np.nanstd(y)
+        std_diff = np.nanstd(np.diff(y))
+
+        if not math.isfinite(std_orig) or not math.isfinite(std_diff):
+            return (False, np.nan)
+
+        # Avoid division by zero if original std is 0
+        if std_orig == 0:
+            return (std_diff == 0, np.nan)
+
+        return (std_diff < 0.9 * std_orig, np.nan)
+
+def _has_seasonality_safe(y_vals: np.ndarray) -> bool:
+    """Safe wrapper for seasonality check."""
+    try:
+        return bool(_has_seasonality(pd.Series(y_vals)))
+    except Exception:
+        return False
+
+# ----------------------- TS Visualization (moved from app.py) -----------
+
+def create_timeseries_figure(
+    df_hist: pd.DataFrame,
+    measure: str,
+    title: str,
+    pm_value: float,
+    show_dividers: bool = True
+) -> Tuple[Optional[go.Figure], Optional[Dict[str, Any]]]:
+    """
+    Creates a timeseries figure (actual vs predicted) and returns the figure and stats.
+    (Refactored from app.py's _make_ts_fig_with_stats, removing Streamlit dependencies)
+    """
+    vcol = 'flow' if measure == 'flow' else 'balance'
+    if vcol not in df_hist.columns:
+        return None, {"error": f"Column '{vcol}' not found in data."}
+
+    base = df_hist[['date', vcol]].rename(columns={vcol: 'val'}).sort_values('date')
+
+    # Use insample_predict_df which internally handles MoR
+    ins = insample_predict_df(
+        base.rename(columns={'val': vcol}),
+        value_col=vcol,
+        measure=measure,
+        pm_value=float(pm_value)
+    )
+
+    if ins.empty or len(ins) < 2:
+        return None, {"error": "Insufficient data points for prediction."}
+
+    # --- 1. Figure Creation ---
+    fig = go.Figure()
+    # Using styles consistent with the original app.py
+    fig.add_trace(go.Scatter(x=ins['date'], y=ins['actual'], mode='lines', name='actual'))
+    fig.add_trace(go.Scatter(x=ins['date'], y=ins['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='month',
+        yaxis_title='원'
+    )
+    fig.update_yaxes(tickformat=",.0f", separatethousands=True, ticksuffix="")
+
+    # Add PM threshold
+    try:
+        fig = add_materiality_threshold(fig, float(pm_value))
+    except Exception:
+        pass  # Proceed without PM line if utility fails
+
+    # Add time dividers (Year/Quarter)
+    if show_dividers:
+        try:
+            fig = add_period_guides(fig, ins['date'])
+        except Exception:
+            pass  # Proceed without dividers if utility fails
+
+    # --- 2. Statistics Calculation (Logic preserved from app.py) ---
+    stats_output: Dict[str, Any] = {}
+    y_vals = np.asarray(ins['actual'].values, dtype=float)
+    n_months = int(np.isfinite(y_vals).sum())
+
+    # Diagnostics (Seasonality, Stationarity)
+    seas = _has_seasonality_safe(y_vals)
+    stat_ok, pval = _adf_stationary(y_vals)
+
+    stats_output["diagnostics"] = {
+        "seasonality": seas,
+        "stationary": stat_ok,
+        "p_value": pval,
+        "n_months": n_months,
+        "is_short": n_months < 12,
+    }
+
+    # Model Metrics (MAE, MAPE, AIC/BIC)
+    # Sticking to the original definitions used in app.py
+    mae = float(np.mean(np.abs(ins['actual'] - ins['predicted'])))
+    # Handle division by zero safely within the mean calculation
+    actuals = ins['actual']
+    predicted = ins['predicted']
+    mape = float(np.mean(np.where(actuals != 0, np.abs((actuals - predicted) / actuals) * 100, 0)))
+
+    aic = bic = np.nan
+    best_model_name = str(ins['model'].iloc[-1])
+
+    if best_model_name.upper() == "ARIMA":
+        try:
+            # Refit ARIMA to get AIC/BIC (as done in the original app.py)
+            _y = ins['actual'].reset_index(drop=True)
+            _ar = _fit_arima(_y)
+            aic = float(getattr(_ar, "aic", np.nan))
+            bic = float(getattr(_ar, "bic", np.nan))
+        except Exception:
+            pass
+
+    # Trend analysis and Seasonality strength (logic moved exactly from app.py)
+    recent_trend = False
+    # Using y_vals (already defined as float array)
+    if n_months >= 6:
+        x = np.arange(len(y_vals))
+        # Original logic was potentially unsafe with NaNs, but preserving it as requested
+        try:
+            slope = np.polyfit(x, y_vals, 1)[0]
+            recent_trend = abs(slope) > 0.3 * (y_vals.std() + 1e-9)
+        except Exception:
+            pass  # Handle potential issues during polyfit
+
+    try:
+        # Calculate seasonality strength (logic moved exactly from app.py)
+        ac = np.abs(np.fft.rfft((y_vals - y_vals.mean())))
+        core = ac[2:] if ac.size > 2 else ac
+        seas_strength_raw = float(core.max() / (core.mean() + 1e-9)) if core.size else 0.0
+        seas_strength = max(0.0, min((seas_strength_raw - 1.0) / 4.0, 1.0))
+    except Exception:
+        seas_strength = 0.0
+
+    # Prepare diagnostics dictionary for model_reason_text
+    diagnostics_for_reasoning = {
+        "n_points": n_months,
+        "seasonality_strength": seas_strength,
+        "stationary": bool(stat_ok),
+        "recent_trend": bool(recent_trend),
+        "cv_mape_rank": 1,  # Assuming this is the best model (Rank 1)
+        "mae": mae, "mape": mape, "aic": aic, "bic": bic,
+    }
+
+    # Get model reasoning text
+    reasoning_text = model_reason_text(best_model_name, diagnostics_for_reasoning)
+
+    # Metadata
+    train_months = int(ins['train_months'].iloc[-1])
+    span_txt = str(ins['data_span'].iloc[-1])
+    sigma_window = int(ins['sigma_win'].iloc[-1])
+
+    stats_output["metrics"] = {"mae": mae, "mape": mape, "aic": aic, "bic": bic}
+    stats_output["metadata"] = {
+        "model": best_model_name, "train_months": train_months,
+        "data_span": span_txt, "sigma_window": sigma_window,
+        "reasoning": reasoning_text,
+    }
+
+    # Detailed stats for the "expander" view in UI
+    stats_output["details"] = {
+        "모델": best_model_name, "학습기간(월)": train_months, "데이터 구간": span_txt,
+        "σ 윈도우(최근)": sigma_window, "CV(K)": 3,
+    }
+
+    return fig, stats_output
 
 
 

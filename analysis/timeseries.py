@@ -5,6 +5,23 @@ from typing import Any, Dict, List, Optional, Tuple, Callable
 import math
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+
+# Attempt to import visualization and helper utilities (assuming they exist in the project structure)
+try:
+    from utils.viz import add_period_guides, add_materiality_threshold
+except ImportError:
+    # Fallbacks if utils.viz is not found
+    def add_period_guides(fig, dates):
+        return fig
+    def add_materiality_threshold(fig, threshold):
+        return fig
+try:
+    from utils.helpers import model_reason_text
+except ImportError:
+    # Fallback if utils.helpers is not found
+    def model_reason_text(model_name, diagnostics):
+        return f"Model {model_name} was selected based on cross-validation metrics."
 
 # -------- Optional config / anomaly imports with safe fallbacks --------
 try:
@@ -551,3 +568,194 @@ def validation_summary(
         "last_z": z,
         "pm_ratio": pm_ratio,
     }
+
+
+# ========================================================================
+# ============= NEW: Functions moved from app.py for Refactoring =========
+# ========================================================================
+
+# ----------------------- TS Diagnostics (moved from app.py) -------------
+
+def _adf_stationary(y_vals: np.ndarray) -> Tuple[bool, float]:
+    """ADF test for stationarity."""
+    try:
+        from statsmodels.tsa.stattools import adfuller
+        y_clean = np.asarray(y_vals, dtype=float)
+        # ADF requires finite values and sufficient length
+        if not np.all(np.isfinite(y_clean)) or len(y_clean) < 3:  # ADF needs at least 3 points for default settings
+            return (False, np.nan)
+
+        p = float(adfuller(y_clean)[1])
+        return (p < 0.05, p)  # True=정상성 확보
+    except Exception:
+        # 간단 폴백 (원본 로직 유지)
+        y = np.asarray(y_vals, dtype=float)
+        if len(y) < 6:
+            return (False, np.nan)
+
+        std_orig = np.nanstd(y)
+        std_diff = np.nanstd(np.diff(y))
+
+        if not math.isfinite(std_orig) or not math.isfinite(std_diff):
+            return (False, np.nan)
+
+        # Avoid division by zero if original std is 0
+        if std_orig == 0:
+            return (std_diff == 0, np.nan)
+
+        return (std_diff < 0.9 * std_orig, np.nan)
+
+def _has_seasonality_safe(y_vals: np.ndarray) -> bool:
+    """Safe wrapper for seasonality check."""
+    try:
+        return bool(_has_seasonality(pd.Series(y_vals)))
+    except Exception:
+        return False
+
+# ----------------------- TS Visualization (moved from app.py) -----------
+
+def create_timeseries_figure(
+    df_hist: pd.DataFrame,
+    measure: str,
+    title: str,
+    pm_value: float,
+    show_dividers: bool = True
+) -> Tuple[Optional[go.Figure], Optional[Dict[str, Any]]]:
+    """
+    Creates a timeseries figure (actual vs predicted) and returns the figure and stats.
+    (Refactored from app.py's _make_ts_fig_with_stats, removing Streamlit dependencies)
+    """
+    vcol = 'flow' if measure == 'flow' else 'balance'
+    if vcol not in df_hist.columns:
+        return None, {"error": f"Column '{vcol}' not found in data."}
+
+    base = df_hist[['date', vcol]].rename(columns={vcol: 'val'}).sort_values('date')
+
+    # Use insample_predict_df which internally handles MoR
+    ins = insample_predict_df(
+        base.rename(columns={'val': vcol}),
+        value_col=vcol,
+        measure=measure,
+        pm_value=float(pm_value)
+    )
+
+    if ins.empty or len(ins) < 2:
+        return None, {"error": "Insufficient data points for prediction."}
+
+    # --- 1. Figure Creation ---
+    fig = go.Figure()
+    # Using styles consistent with the original app.py
+    fig.add_trace(go.Scatter(x=ins['date'], y=ins['actual'], mode='lines', name='actual'))
+    fig.add_trace(go.Scatter(x=ins['date'], y=ins['predicted'], mode='lines', name='predicted', line=dict(dash='dot')))
+
+    fig.update_layout(
+        title=title,
+        xaxis_title='month',
+        yaxis_title='원'
+    )
+    fig.update_yaxes(tickformat=",.0f", separatethousands=True, ticksuffix="")
+
+    # Add PM threshold
+    try:
+        fig = add_materiality_threshold(fig, float(pm_value))
+    except Exception:
+        pass  # Proceed without PM line if utility fails
+
+    # Add time dividers (Year/Quarter)
+    if show_dividers:
+        try:
+            fig = add_period_guides(fig, ins['date'])
+        except Exception:
+            pass  # Proceed without dividers if utility fails
+
+    # --- 2. Statistics Calculation (Logic preserved from app.py) ---
+    stats_output: Dict[str, Any] = {}
+    y_vals = np.asarray(ins['actual'].values, dtype=float)
+    n_months = int(np.isfinite(y_vals).sum())
+
+    # Diagnostics (Seasonality, Stationarity)
+    seas = _has_seasonality_safe(y_vals)
+    stat_ok, pval = _adf_stationary(y_vals)
+
+    stats_output["diagnostics"] = {
+        "seasonality": seas,
+        "stationary": stat_ok,
+        "p_value": pval,
+        "n_months": n_months,
+        "is_short": n_months < 12,
+    }
+
+    # Model Metrics (MAE, MAPE, AIC/BIC)
+    # Sticking to the original definitions used in app.py
+    mae = float(np.mean(np.abs(ins['actual'] - ins['predicted'])))
+    # Handle division by zero safely within the mean calculation
+    actuals = ins['actual']
+    predicted = ins['predicted']
+    mape = float(np.mean(np.where(actuals != 0, np.abs((actuals - predicted) / actuals) * 100, 0)))
+
+    aic = bic = np.nan
+    best_model_name = str(ins['model'].iloc[-1])
+
+    if best_model_name.upper() == "ARIMA":
+        try:
+            # Refit ARIMA to get AIC/BIC (as done in the original app.py)
+            _y = ins['actual'].reset_index(drop=True)
+            _ar = _fit_arima(_y)
+            aic = float(getattr(_ar, "aic", np.nan))
+            bic = float(getattr(_ar, "bic", np.nan))
+        except Exception:
+            pass
+
+    # Trend analysis and Seasonality strength (logic moved exactly from app.py)
+    recent_trend = False
+    # Using y_vals (already defined as float array)
+    if n_months >= 6:
+        x = np.arange(len(y_vals))
+        # Original logic was potentially unsafe with NaNs, but preserving it as requested
+        try:
+            slope = np.polyfit(x, y_vals, 1)[0]
+            recent_trend = abs(slope) > 0.3 * (y_vals.std() + 1e-9)
+        except Exception:
+            pass  # Handle potential issues during polyfit
+
+    try:
+        # Calculate seasonality strength (logic moved exactly from app.py)
+        ac = np.abs(np.fft.rfft((y_vals - y_vals.mean())))
+        core = ac[2:] if ac.size > 2 else ac
+        seas_strength_raw = float(core.max() / (core.mean() + 1e-9)) if core.size else 0.0
+        seas_strength = max(0.0, min((seas_strength_raw - 1.0) / 4.0, 1.0))
+    except Exception:
+        seas_strength = 0.0
+
+    # Prepare diagnostics dictionary for model_reason_text
+    diagnostics_for_reasoning = {
+        "n_points": n_months,
+        "seasonality_strength": seas_strength,
+        "stationary": bool(stat_ok),
+        "recent_trend": bool(recent_trend),
+        "cv_mape_rank": 1,  # Assuming this is the best model (Rank 1)
+        "mae": mae, "mape": mape, "aic": aic, "bic": bic,
+    }
+
+    # Get model reasoning text
+    reasoning_text = model_reason_text(best_model_name, diagnostics_for_reasoning)
+
+    # Metadata
+    train_months = int(ins['train_months'].iloc[-1])
+    span_txt = str(ins['data_span'].iloc[-1])
+    sigma_window = int(ins['sigma_win'].iloc[-1])
+
+    stats_output["metrics"] = {"mae": mae, "mape": mape, "aic": aic, "bic": bic}
+    stats_output["metadata"] = {
+        "model": best_model_name, "train_months": train_months,
+        "data_span": span_txt, "sigma_window": sigma_window,
+        "reasoning": reasoning_text,
+    }
+
+    # Detailed stats for the "expander" view in UI
+    stats_output["details"] = {
+        "모델": best_model_name, "학습기간(월)": train_months, "데이터 구간": span_txt,
+        "σ 윈도우(최근)": sigma_window, "CV(K)": 3,
+    }
+
+    return fig, stats_output
