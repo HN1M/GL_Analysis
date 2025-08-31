@@ -1,9 +1,10 @@
 import pandas as pd
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 try:
-    from analysis.contracts import ModuleResult
+    from analysis.contracts import ModuleResult, LedgerFrame
 except Exception:
     ModuleResult = None  # 타입 힌트/런타임 가드
+    LedgerFrame = None   # 타입 힌트/런타임 가드
 
 
 def analyze_reconciliation(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
@@ -47,14 +48,22 @@ def analyze_reconciliation(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
 
 
 # NEW: 표준 DTO(ModuleResult) 반환 래퍼
-def run_integrity_module(ledger_df: pd.DataFrame, master_df: pd.DataFrame):
+def run_integrity_module(lf: LedgerFrame, accounts: Optional[List[str]] = None):
     """
     기존 analyze_reconciliation 결과를 표준 ModuleResult로 감쌉니다.
     - summary: 상태/계정 수/Fail·Warning 건수/최대 차이
     - tables: {"reconciliation": 결과 DF}
     - evidences: (MVP 단계) 비움
     """
+    ledger_df = lf.df if hasattr(lf, 'df') else lf
+    master_df = (lf.meta or {}).get('master_df') if hasattr(lf, 'meta') else None
     status, df = analyze_reconciliation(ledger_df, master_df)
+    if accounts:
+        try:
+            accs = [str(a) for a in accounts]
+            df = df[df['계정코드'].astype(str).isin(accs)].copy()
+        except Exception:
+            pass
     summary: Dict[str, Any] = {
         "status": str(status),
         "n_accounts": int(df["계정코드"].nunique()) if (df is not None and not df.empty and "계정코드" in df.columns) else 0,

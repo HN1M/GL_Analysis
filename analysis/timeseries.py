@@ -338,6 +338,10 @@ def run_timeseries_module(
     work = df[[account_col, date_col, amount_col]].copy()
     work.columns = ["account","date","amount"]
     work = work.sort_values(["account","date"])
+    # 최소 포인트 가드: 계정별 date 유니크가 부족하면 빈 결과 반환
+    MIN_POINTS = 6
+    if work["date"].nunique() < MIN_POINTS:
+        return pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
     all_rows: List[pd.DataFrame] = []
     for acc, g in work.groupby("account", dropna=False):
         mon = g[["date","amount"]].rename(columns={"amount":"flow"}).copy()

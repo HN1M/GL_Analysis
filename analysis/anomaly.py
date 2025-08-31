@@ -187,6 +187,11 @@ def run_anomaly_module(lf, target_accounts=None, topn=20, pm_value: Optional[flo
             links={
                 "account_code": str(r.get('계정코드','')),
                 "account_name": str(r.get('계정명','')),
+                "vendor":      str(r.get('거래처','')),
+                "narration":   str(r.get('적요','')),
+                "cluster_name": str(r.get('cluster_name','')) if 'cluster_name' in r.index else "",
+                "cluster_group": str(r.get('cluster_group','')) if 'cluster_group' in r.index else "",
+                "month":       str(r.get('연월','')) if '연월' in r.index else "",
                 "period_tag": str(r.get('period_tag','')),
             }
         ))

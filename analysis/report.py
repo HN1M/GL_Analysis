@@ -130,9 +130,14 @@ def build_report_context_from_modules(
                         if measure: tag += f"[{measure}]"
                         if model:   tag += f"[{model}]"
                         rsn  = str(getattr(e, "reason", ""))
+                        desc = []
+                        for k2 in ["vendor","narration","cluster_name","cluster_group","month"]:
+                            v = lnk.get(k2)
+                            if v: desc.append(f"{k2}={str(v)[:60]}")
+                        desc_txt = (" " + "; ".join(desc)) if desc else ""
                         lines.append(
                             _strip_control(
-                                f"  - {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit}{amt_txt} reason={rsn}"
+                                f"  - {tag} {acct_nm}({acct_cd}) risk={risk:.2f} KIT={kit}{amt_txt} reason={rsn}{desc_txt}"
                             )
                         )
                     except Exception:

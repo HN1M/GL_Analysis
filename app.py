@@ -36,17 +36,22 @@ from analysis.embedding import (
     ensure_rich_embedding_text,
     perform_embedding_and_clustering,
     perform_embedding_only,
+    unify_cluster_names_with_llm,
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
 from services.llm import LLMClient
 from services.cache import get_or_embed_texts
-from services.cycles_store import get_effective_cycles
-from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU
+import services.cycles_store as cyc
+from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU, EMB_MODEL_SMALL
 try:
     from config import PM_DEFAULT
 except Exception:
     PM_DEFAULT = 500_000_000
 from utils.viz import add_materiality_threshold, add_pm_badge
+from services.cluster_naming import (
+    make_synonym_confirm_fn,
+    unify_cluster_labels_llm,
+)
 
 # --- KRW 입력(천단위 콤마) 유틸: 콜백 기반으로 안정화 ---
 def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "") -> int:
@@ -92,6 +97,23 @@ def _krw_input(label: str, key: str, *, default_value: int, help_text: str = "")
     st.session_state[key] = int(live_val)
 
     return int(st.session_state[key])
+
+
+# 사이클 프리셋을 계정 선택기로 주입하는 헬퍼
+def _apply_cycles_to_picker(*, upload_id: str, cycles_state_key: str, accounts_state_key: str, master_df: pd.DataFrame):
+    """선택된 사이클의 계정들을 계정 멀티셀렉트에 합쳐 넣어준다."""
+    cycles_map = cyc.get_effective_cycles(upload_id)
+    chosen_cycles = st.session_state.get(cycles_state_key, []) or []
+    # 지원: KO 라벨 또는 코드 라벨 — 공식 KO 라벨 집합 기준으로 판별
+    KO_LABELS = set(cyc.CYCLE_KO.values())
+    if chosen_cycles and all(lbl in KO_LABELS for lbl in chosen_cycles):
+        codes = cyc.accounts_for_cycles_ko(cycles_map, chosen_cycles)
+    else:
+        codes = cyc.accounts_for_cycles(cycles_map, chosen_cycles)
+    names = (master_df[master_df['계정코드'].astype(str).isin(codes)]['계정명']
+                .dropna().astype(str).unique().tolist())
+    cur = set(st.session_state.get(accounts_state_key, []) or [])
+    st.session_state[accounts_state_key] = sorted(cur.union(names))
 
 
 # --- 3. UI 부분 ---
@@ -343,6 +365,53 @@ if uploaded_file is not None:
 
             if st.session_state.analysis_done:
                 st.success("✅ 분석이 완료되었습니다. 아래 탭에서 결과를 확인하세요.")
+                # --- 계정→사이클 매핑 검토/수정 ---
+                upload_id = getattr(uploaded_file, "name", "uploaded.xlsx")
+                # 업로드 직후 1회: 프리셋 없으면 룰베이스 자동 생성
+                names_dict = (
+                    master_df[['계정코드','계정명']]
+                        .drop_duplicates()
+                        .assign(계정코드=lambda d: d['계정코드'].astype(str))
+                        .set_index('계정코드')['계정명'].astype(str).to_dict()
+                )
+                if not cyc.get_effective_cycles(upload_id):
+                    cyc.build_cycles_preset(upload_id, names_dict, use_llm=False)
+
+                with st.expander("🧭 계정 → 사이클 매핑 검토/수정", expanded=False):
+                    cur_map = cyc.get_effective_cycles(upload_id)
+                    map_df = master_df[['계정코드','계정명']].drop_duplicates().copy()
+                    map_df['계정코드'] = map_df['계정코드'].astype(str)
+                    map_df['사이클(표시)'] = map_df['계정코드'].map(lambda c: cyc.code_to_ko(cur_map.get(c, 'Other')))
+
+                    st.caption("사이클 라벨을 수정한 뒤 저장을 누르세요. (표시는 한글, 내부는 코드로 저장됩니다)")
+                    edited = st.data_editor(
+                        map_df, hide_index=True, use_container_width=True,
+                        column_config={
+                            "사이클(표시)": st.column_config.SelectboxColumn(
+                                options=list(cyc.CYCLE_KO.values()), required=True
+                            )
+                        }
+                    )
+
+                    c1, c2, c3 = st.columns(3)
+                    with c1:
+                        if st.button("💾 매핑 저장", type="primary", key="btn_save_cycles_map"):
+                            new_map_codes = {
+                                str(r['계정코드']): cyc.ko_to_code(r['사이클(표시)'])
+                                for _, r in edited.iterrows()
+                            }
+                            cyc.set_cycles_map(upload_id, new_map_codes)
+                            st.success(f"저장됨: {len(new_map_codes):,}개 계정")
+                    with c2:
+                        if st.button("🤖 LLM 추천 병합", help="룰베이스 결과 위에 LLM 제안을 덮어씌웁니다", key="btn_merge_llm_cycles"):
+                            cyc.build_cycles_preset(upload_id, names_dict, use_llm=True)
+                            st.success("LLM 추천을 병합했습니다.")
+                            st.rerun()
+                    with c3:
+                        if st.button("↺ 룰베이스로 초기화", key="btn_reset_rule_cycles"):
+                            cyc.build_cycles_preset(upload_id, names_dict, use_llm=False)
+                            st.success("룰베이스로 초기화했습니다.")
+                            st.rerun()
                 with st.expander("🔍 빠른 진단(데이터 품질 체크)", expanded=False):
                     df = st.session_state.ledger_df.copy()
                     issues = []
@@ -401,8 +470,22 @@ if uploaded_file is not None:
                     account_list = st.session_state.master_df['계정명'].unique()
                     selected_accounts = st.multiselect(
                         "분석할 계정을 선택하세요 (1개 이상 필수)",
-                        account_list, default=[]
+                        account_list, default=[],
+                        key="trend_accounts_pick"
                     )
+                    # ▼ 사이클 프리셋(선택 시 위 멀티셀렉트에 계정 자동 반영)
+                    cycles_map_now = cyc.get_effective_cycles(upload_id)
+                    if cycles_map_now:
+                        picked_cycles = st.multiselect(
+                            "사이클 프리셋 선택(선택하면 위 계정 목록에 자동 반영)",
+                            list(cyc.CYCLE_KO.values()),
+                            default=[], key="trend_cycles_pick"
+                        )
+                        st.button("➕ 프리셋 적용", key="btn_apply_cycles_trend", on_click=_apply_cycles_to_picker,
+                                  kwargs=dict(upload_id=upload_id,
+                                              cycles_state_key="trend_cycles_pick",
+                                              accounts_state_key="trend_accounts_pick",
+                                              master_df=st.session_state.master_df))
                     if not selected_accounts:
                         st.info("계정을 1개 이상 선택하면 월별 추이 그래프가 표시됩니다.")
                     else:
@@ -436,8 +519,20 @@ if uploaded_file is not None:
                         "상관 분석 대상 계정(2개 이상 선택)",
                         account_list,
                         default=selected_accounts,
-                        help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다."
+                        help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다.",
+                        key="corr_accounts_pick"
                     )
+                    cycles_map_now = cyc.get_effective_cycles(upload_id)
+                    if cycles_map_now:
+                        picked_cycles_corr = st.multiselect(
+                            "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
+                            default=[], key="corr_cycles_pick"
+                        )
+                        st.button("➕ 프리셋 적용", key="btn_apply_cycles_corr", on_click=_apply_cycles_to_picker,
+                                  kwargs=dict(upload_id=upload_id,
+                                              cycles_state_key="corr_cycles_pick",
+                                              accounts_state_key="corr_accounts_pick",
+                                              master_df=st.session_state.master_df))
                     corr_thr = st.slider(
                         "상관 임계치(강한 상관쌍 표 전용)",
                         min_value=0.50, max_value=0.95, step=0.05, value=0.70,
@@ -448,12 +543,12 @@ if uploaded_file is not None:
                     else:
                         lf_use = _lf_by_scope()
                         mdf = st.session_state.master_df
-                        codes = mdf[mdf['계정명'].isin(corr_accounts)]['계정코드'].astype(str).tolist()
+                        codes = mdf[mdf['계정명'].isin(st.session_state["corr_accounts_pick"])]['계정코드'].astype(str).tolist()
                         cmod = run_correlation_module(
                             lf_use,
                             accounts=codes,
                             corr_threshold=float(corr_thr),
-                            cycles_map=get_effective_cycles(),
+                            cycles_map=cyc.get_effective_cycles(upload_id),
                         )
                         _push_module(cmod)
                         for w in cmod.warnings:
@@ -461,17 +556,54 @@ if uploaded_file is not None:
                         if cmod.figures:
                             stable_codes = "_".join(map(str, codes)) or "all"
                             stable_thr = str(int(corr_thr*100))
-                            st.plotly_chart(
-                                cmod.figures['heatmap'],
-                                use_container_width=True,
-                                key=f"corr_heatmap_{stable_codes}_{stable_thr}"
-                            )
+                            if 'heatmap' in cmod.figures:
+                                fig = cmod.figures['heatmap']
+                                try:
+                                    name_map = dict(zip(
+                                        mdf["계정코드"].astype(str),
+                                        mdf["계정명"].astype(str)
+                                    ))
+                                    tr = fig.data[0]
+                                    x_codes = list(map(str, getattr(tr, 'x', [])))
+                                    y_codes = list(map(str, getattr(tr, 'y', [])))
+                                    x_names = [name_map.get(c, c) for c in x_codes]
+                                    y_names = [name_map.get(c, c) for c in y_codes]
+                                    # x/y를 계정명으로 치환 → 호버에도 계정명이 노출됨
+                                    tr.update(x=x_names, y=y_names)
+                                    fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
+                                except Exception:
+                                    pass
+                                st.plotly_chart(
+                                    fig,
+                                    use_container_width=True,
+                                    key=f"corr_heatmap_{stable_codes}_{stable_thr}"
+                                )
                         if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
                             st.markdown("**임계치 이상 상관쌍**")
-                            st.dataframe(cmod.tables['strong_pairs'], use_container_width=True)
+                            sp = cmod.tables['strong_pairs'].copy()
+                            name_map = dict(zip(
+                                mdf["계정코드"].astype(str),
+                                mdf["계정명"].astype(str)
+                            ))
+                            for col in ["계정코드_A", "계정코드_B"]:
+                                sp[col] = sp[col].astype(str)
+                            sp.insert(0, "계정명_A", sp["계정코드_A"].map(name_map))
+                            sp.insert(1, "계정명_B", sp["계정코드_B"].map(name_map))
+                            sp = sp[["계정명_A", "계정명_B", "상관계수", "계정코드_A", "계정코드_B"]]
+                            st.dataframe(sp, use_container_width=True, height=320)
                         if 'excluded_accounts' in cmod.tables and not cmod.tables['excluded_accounts'].empty:
                             with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
-                                st.dataframe(cmod.tables['excluded_accounts'], use_container_width=True)
+                                exc = cmod.tables['excluded_accounts'].copy()
+                                if '계정코드' in exc.columns:
+                                    name_map = dict(zip(
+                                        mdf["계정코드"].astype(str),
+                                        mdf["계정명"].astype(str)
+                                    ))
+                                    exc['계정코드'] = exc['계정코드'].astype(str)
+                                    exc['계정명'] = exc['계정코드'].map(name_map)
+                                    cols = ['계정명', '계정코드'] + [c for c in exc.columns if c not in ('계정명','계정코드')]
+                                    exc = exc[cols]
+                                st.dataframe(exc, use_container_width=True)
 
                 with tab_vendor:
                     st.header("거래처 심층 분석")
@@ -480,7 +612,18 @@ if uploaded_file is not None:
                     st.subheader("거래처 집중도 및 활동성 (계정별)")
                     master_df_res = st.session_state.master_df
                     account_list_vendor = master_df_res['계정명'].unique()
-                    selected_accounts_vendor = st.multiselect("분석할 계정(들)을 선택하세요.", account_list_vendor, default=[])
+                    selected_accounts_vendor = st.multiselect("분석할 계정(들)을 선택하세요.", account_list_vendor, default=[], key="vendor_accounts_pick")
+                    cycles_map_now = cyc.get_effective_cycles(upload_id)
+                    if cycles_map_now:
+                        picked_cycles_vendor = st.multiselect(
+                            "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
+                            default=[], key="vendor_cycles_pick"
+                        )
+                        st.button("➕ 프리셋 적용", key="btn_apply_cycles_vendor", on_click=_apply_cycles_to_picker,
+                                  kwargs=dict(upload_id=upload_id,
+                                              cycles_state_key="vendor_cycles_pick",
+                                              accounts_state_key="vendor_accounts_pick",
+                                              master_df=st.session_state.master_df))
 
                     # 🔧 최소 거래금액(연간, CY) 필터 — KRW 입력(커밋 시 쉼표 정규화)
                     min_amount_vendor = _krw_input(
@@ -851,8 +994,20 @@ if uploaded_file is not None:
                     pick_accounts = st.multiselect(
                         "보고서 대상 계정(들)을 선택하세요. (최소 1개)",
                         options=acct_names_all,
-                        default=[]
+                        default=[],
+                        key="report_accounts_pick"
                     )
+                    cycles_map_now = cyc.get_effective_cycles(upload_id)
+                    if cycles_map_now:
+                        picked_cycles_report = st.multiselect(
+                            "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
+                            default=[], key="report_cycles_pick"
+                        )
+                        st.button("➕ 프리셋 적용", key="btn_apply_cycles_report", on_click=_apply_cycles_to_picker,
+                                  kwargs=dict(upload_id=upload_id,
+                                              cycles_state_key="report_cycles_pick",
+                                              accounts_state_key="report_accounts_pick",
+                                              master_df=st.session_state.master_df))
                     # ② 옵션 제거: 항상 수행 플래그
                     opt_knn_evidence = True
                     opt_patterns = True
@@ -866,7 +1021,7 @@ if uploaded_file is not None:
 
                     # ④ 선택 계정코드 매핑
                     pick_codes = (
-                        mdf[mdf['계정명'].isin(pick_accounts)]['계정코드']
+                        mdf[mdf['계정명'].isin(st.session_state['report_accounts_pick'])]['계정코드']
                         .astype(str).tolist()
                     )
 
@@ -914,23 +1069,26 @@ if uploaded_file is not None:
                                     s.write(f"    └ 데이터가 많아 {max_rows:,}건으로 샘플링")
                                 df_cy_small = ensure_rich_embedding_text(df_cy_small)
                                 try:
-                                    emb_client = LLMClient(model=st.session_state.get('llm_model')).client  # OpenAI 클라이언트 객체
+                                    llm_service = LLMClient(model=st.session_state.get('llm_model', 'gpt-4o'))
+                                    emb_client = llm_service.client  # OpenAI 클라이언트 객체
+                                    naming_function = llm_service.name_cluster
                                     # 보고서 생성을 위해 LLM 기반 클러스터 네이밍을 필수로 요구
                                     df_clu, ok = perform_embedding_and_clustering(
                                         df_cy_small, emb_client,
                                         name_with_llm=True, must_name_with_llm=True,
                                         use_large=bool(st.session_state.get("use_large_embedding", False)),
                                         rescue_tau=float(st.session_state.get("rescue_tau", HDBSCAN_RESCUE_TAU)),
-                                        llm_model=st.session_state.get('llm_model', 'gpt-4o'),
                                         embed_texts_fn=get_or_embed_texts,
+                                        naming_fn=naming_function,
                                     )
                                     if ok:
                                         # 유사한 클러스터 이름을 LLM으로 통합
-                                        from analysis.embedding import unify_cluster_names_with_llm, unify_cluster_labels_llm
                                         df_clu, name_map = unify_cluster_names_with_llm(
-                                            df_clu, emb_client,
-                                            llm_model=st.session_state.get('llm_model', 'gpt-4o'),
-                                            embed_texts_fn=get_or_embed_texts
+                                            df_clu,
+                                            sim_threshold=0.90,
+                                            emb_model=st.session_state.get('embedding_model', None) or EMB_MODEL_SMALL,
+                                            embed_texts_fn=get_or_embed_texts,
+                                            confirm_pair_fn=make_synonym_confirm_fn(emb_client, st.session_state.get('llm_model', 'gpt-4o')),
                                         )
                                         # 추가 LLM 라벨 통합(JSON 매핑 방식) — CY의 cluster_group은 유지
                                         try:
@@ -1130,15 +1288,15 @@ if uploaded_file is not None:
                                                                             cycles_map=get_effective_cycles()))
                                 except Exception as _e:
                                     st.warning(f"correlation 모듈 실패: {_e}")
-                                # 정합성(레거시→DTO)
+                                # 정합성(ModuleResult) — 선택 계정 필터 적용
                                 try:
-                                    _push_module(run_integrity_module(ldf, mdf))
+                                    _push_module(run_integrity_module(lf_use, accounts=pick_codes))
                                 except Exception as _e:
                                     st.warning(f"integrity 모듈 실패: {_e}")
                                 # NEW: 시계열 포함(집계→DTO 래핑)
                                 try:
                                     if not df_cy.empty:
-                                        ts = df_cy.copy()
+                                        ts = pd.concat([df_cy, df_py], ignore_index=True)
                                         ts["date"] = pd.to_datetime(ts["회계일자"], errors="coerce").dt.to_period("M").dt.to_timestamp()
                                         ts["account"] = ts["계정코드"].astype(str)
                                         ts["amount"] = ts.get("발생액", 0.0).astype(float)
@@ -1151,7 +1309,7 @@ if uploaded_file is not None:
                                             "max_abs_z": float(df_ts["z"].abs().max()) if ("z" in df_ts.columns and not df_ts.empty) else 0.0,
                                         }
                                         _push_module(ModuleResult(name="timeseries", summary=summ_ts,
-                                                                  tables={"ts": df_ts}, figures={}, evidences=[], warnings=[]))
+                                                                  tables={"ts": df_ts}, figures={}, evidences=[], warnings=([] if not df_ts.empty else ["insufficient_points"])))
                                 except Exception as _e:
                                     st.warning(f"timeseries 모듈 실패: {_e}")
 
