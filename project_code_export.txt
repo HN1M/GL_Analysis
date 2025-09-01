@@ -51,16 +51,18 @@ from analysis.embedding import (
     unify_cluster_names_with_llm,
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
-from services.llm import LLMClient
-from services.cache import get_or_embed_texts
+from services.llm import LLMClient, openai_available
+from services.cache import get_or_embed_texts, cache_get_many, get_cache_info
 import services.cycles_store as cyc
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU, EMB_MODEL_SMALL
 try:
-    from config import PM_DEFAULT
+    from config import PM_DEFAULT, IFOREST_CONTAM_DEFAULT
 except Exception:
     PM_DEFAULT = 500_000_000
+    IFOREST_CONTAM_DEFAULT = 0.03
 from utils.viz import add_materiality_threshold, add_pm_badge
 from services.cluster_naming import (
+    make_llm_name_fn,
     make_synonym_confirm_fn,
     unify_cluster_labels_llm,
 )
@@ -312,6 +314,18 @@ def _render_corr_advanced_tab(*, upload_id: str):
                 max_lag=int(st.session_state.get("corr_adv_maxlag", 6)),
                 rolling_window=int(st.session_state.get("corr_adv_rollwin", 6)),
             )
+            with st.expander("🧭 해석 가이드", expanded=False):
+                st.markdown("""
+- **기본 상관**: 월별 **부호 포함** 발생액을 이용해 단순 피어슨 상관(시차 0)을 계산합니다.
+- **고급 상관**: 월별 **절대발생액(규모)** 피벗을 기준으로 상관을 계산하고,  
+  `최대 시차(개월)` 범위에서 **최적시차**를 탐색하며, `롤링 윈도우`로 **시간에 따른 상관의 안정성**(변동성)을 봅니다.
+- 두 결과가 다를 수 있는 이유:
+  1) 기본은 ‘방향(+,−)’을 반영 ⇒ 대체/상쇄 관계가 드러남  
+  2) 고급은 ‘규모(절대값)’을 반영 ⇒ **같이 크다/같이 작다** 패턴을 포착  
+  3) 시차/롤링을 쓰면 **시점 어긋남**이나 **일시적 관계**가 보정/드러납니다.
+- **롤링 상관성**: 일정 개월 창으로 이동하며 계산한 상관의 **평균과 표준편차**로 안정성을 봅니다.  
+  표준편차가 낮을수록 ‘관계가 안정적’입니다.
+""")
             st.subheader("히트맵")
             if "heatmap" in mr.figures:
                 st.plotly_chart(mr.figures["heatmap"], use_container_width=True)
@@ -884,27 +898,136 @@ if uploaded_file is not None:
 
                 with tab_anomaly:
                     st.header("이상 패턴 탐지")
+                    st.caption("z-점수 외에도 임베딩 기반 의미분석과 Isolation Forest를 선택해 다각도로 탐지할 수 있습니다.")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
+                    with st.expander("🧭 해석 가이드", expanded=False):
+                        st.markdown(
+                            """
+- **Z-Score(기본)**: 같은 계정 내 다른 전표들과 비교해 '금액'이 얼마나 튀는지 점수화합니다.
+- **임베딩 의미분석**: 적요/거래처/월 등의 **텍스트 의미**를 벡터로 바꿔, 계정의 '평균 의미'와 **멀리 떨어진 전표**를 찾습니다.
+- **하위클러스터링**: 한 계정 안에 성격이 다른 전표 뭉치가 섞여 있으면, 뭉치별 기준으로 이상치를 봅니다(정확도↑).
+- **Isolation Forest**: 금액·|Z|·의미거리·월 등 **복합 피처**로 이상 점수(0~1)를 계산합니다.
+                            """
+                        )
                     mdf = st.session_state.master_df
                     acct_names = mdf['계정명'].unique()
                     pick = st.multiselect("대상 계정 선택(미선택 시 자동 추천)", acct_names, default=[])
                     topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=500, value=20, step=10)
+
+                    # --- NEW: 탐지 옵션 ---
+                    opt1, opt2, opt3 = st.columns(3)
+                    with opt1:
+                        use_semantic = st.checkbox("임베딩 의미분석", value=True, help="OpenAI 키 필요. 적요/거래처 문장의 의미적 이탈을 포착합니다.")
+                        use_subcluster = st.checkbox("하위클러스터링", value=False, help="계정 내 유사 거래를 묶어 그룹별 이탈을 봅니다.")
+                    with opt2:
+                        use_iforest = st.checkbox("Isolation Forest", value=True, help="수치 특징(금액·|Z| 등)으로 비감독 이상치 탐지.")
+                        contam = st.slider("IForest contamination(이상 비율)", 0.01, 0.20, float(IFOREST_CONTAM_DEFAULT), 0.01, disabled=not use_iforest)
+                    with opt3:
+                        # --- NEW: 클러스터 네이밍/동의어 통합 ---
+                        use_name = st.checkbox("클러스터 이름붙이기(LLM)", value=False, help="클러스터별 샘플 적요/거래처로 짧은 한글 이름 생성")
+                        use_unify = st.checkbox("이름 통합(동의어 묶기)", value=True, help="유사한 클러스터명을 하나로 묶음")
+
                     if st.button("이상치 분석 실행"):
                         lf_use = _lf_by_scope()
                         codes = None
                         if pick:
                             codes = mdf[mdf['계정명'].isin(pick)]['계정코드'].astype(str).tolist()
-                        amod = run_anomaly_module(lf_use, target_accounts=codes, topn=topn, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                        # --- NEW: 임베딩 계측 래퍼 + 네이밍 콜백 준비 ---
+                        def embed_with_stats(texts, *, client=None, model=None, batch_size=64, timeout=60, max_retry=2):
+                            import time
+                            uniq = list(dict.fromkeys([str(t) for t in texts]))
+                            t0 = time.time()
+                            cached_before = cache_get_many(model, uniq) or {}
+                            mapping = get_or_embed_texts(
+                                uniq, client=client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
+                            )
+                            elapsed = time.time() - t0
+                            hits = sum(1 for t in uniq if t in (cached_before or {}))
+                            api_calls = max(0, len(mapping) - hits)
+                            try:
+                                dim = len(next(iter(mapping.values()))) if mapping else 0
+                            except Exception:
+                                dim = 0
+                            st.session_state['last_embed_stats'] = {
+                                "model": model, "n_texts": len(uniq), "cache_hits": hits,
+                                "api_calls": api_calls, "dim": int(dim), "elapsed_sec": round(elapsed, 3),
+                            }
+                            return mapping
+
+                        embed_client, embed_texts_fn = None, None
+                        name_fn, confirm_fn = None, None
+                        if use_semantic:
+                            try:
+                                if openai_available():
+                                    embed_client = LLMClient().client
+                                    embed_texts_fn = embed_with_stats  # 계측 래퍼 주입
+                                    if use_name:
+                                        name_fn = make_llm_name_fn(embed_client, model="gpt-4o-mini")
+                                        confirm_fn = make_synonym_confirm_fn(embed_client, model="gpt-4o-mini") if use_unify else None
+                                else:
+                                    st.info("🔌 OpenAI Key가 없어 의미분석/네이밍은 비활성화됩니다.")
+                            except Exception as e:
+                                st.info(f"의미분석 준비 실패: {e}")
+
+                        amod = run_anomaly_module(
+                            lf_use,
+                            target_accounts=codes,
+                            topn=topn,
+                            pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)),
+                            # --- NEW: injection knobs ---
+                            embed_client=embed_client,
+                            embed_texts_fn=embed_texts_fn,
+                            use_large_embedding=bool(st.session_state.get('use_large_embedding', False)),
+                            semantic_enabled=bool(use_semantic),
+                            subcluster_enabled=bool(use_subcluster),
+                            iforest_enabled=bool(use_iforest),
+                            iforest_contamination=float(contam) if use_iforest else None,
+                            # --- NEW: 네이밍/통합 옵션 ---
+                            name_clusters=bool(use_name), naming_fn=name_fn,
+                            unify_names=bool(use_unify), confirm_pair_fn=confirm_fn,
+                        )
                         _push_module(amod)
                         for w in amod.warnings: st.warning(w)
                         if 'anomaly_top' in amod.tables:
                             _tbl = amod.tables['anomaly_top'].copy()
                             fmt = {}
                             if '발생액' in _tbl.columns: fmt['발생액'] = '{:,.0f}'
-                            if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:.2f}'
+                            if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:+.2f}'
+                            if 'semantic_z' in _tbl.columns: fmt['semantic_z'] = '{:+.2f}'
+                            if 'iforest_score' in _tbl.columns: fmt['iforest_score'] = '{:.2f}'
                             st.dataframe(_tbl.style.format(fmt), use_container_width=True)
                         if 'zscore_hist' in amod.figures:
                             st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True, key="anomaly_hist")
+                        if 'semantic_hist' in amod.figures:
+                            st.plotly_chart(amod.figures['semantic_hist'], use_container_width=True)
+                        if 'iforest_hist' in amod.figures:
+                            st.plotly_chart(amod.figures['iforest_hist'], use_container_width=True)
+
+                        # --- NEW: 신호별 상위 테이블 ---
+                        if 'semantic_top' in amod.tables:
+                            st.subheader("의미 기반 이상(semantic_z) Top")
+                            st.dataframe(amod.tables['semantic_top'].style.format(fmt), use_container_width=True)
+                        if 'iforest_top' in amod.tables:
+                            st.subheader("Isolation Forest Top")
+                            st.dataframe(amod.tables['iforest_top'].style.format(fmt), use_container_width=True)
+
+                        # --- NEW: 클러스터 요약(금액 기준 상위) ---
+                        if 'cluster_summary' in amod.tables:
+                            st.subheader("클러스터 요약(금액 기준 상위)")
+                            _fmt = {'금액합계': '{:,0f}'}
+                            st.dataframe(amod.tables['cluster_summary'].style.format(_fmt), use_container_width=True)
+
+                        # --- NEW: 임베딩/AI 실행 상황판 ---
+                        with st.expander("🔎 임베딩/AI 실행 상황판", expanded=False):
+                            stats = st.session_state.get('last_embed_stats', {})
+                            cache_info = get_cache_info(stats.get("model") or "text-embedding-3-small")
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                            col1.metric("임베딩 모델", stats.get("model", "-"))
+                            col2.metric("고유 텍스트 수", f"{stats.get('n_texts', 0):,}")
+                            col3.metric("캐시 히트", f"{stats.get('cache_hits', 0):,}")
+                            col4.metric("신규 API 콜", f"{stats.get('api_calls', 0):,}")
+                            col5.metric("차원/경과(s)", f"{stats.get('dim', 0)} / {stats.get('elapsed_sec', 0)}")
+                            st.caption(f"캐시 파일: {cache_info.get('path','-')} (rows={cache_info.get('rows','?'):,}, size={cache_info.get('size_bytes',0):,} bytes)")
 
                 with tab_ts:
                     st.header("시계열 예측")
@@ -2332,7 +2455,7 @@ def aggregate_monthly(df: pd.DataFrame, date_col: str, amount_col: str) -> pd.Da
 from __future__ import annotations
 import numpy as np, math
 import pandas as pd
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from utils.helpers import find_column_by_keyword
 from analysis.embedding import ensure_rich_embedding_text, perform_embedding_only  # ← services 주입식 임베딩 사용
 from config import (
@@ -2411,7 +2534,12 @@ def _add_semantic_features(
     embed_client: Any,
     embed_texts_fn,              # injected (e.g., services.cache.get_or_embed_texts)
     use_large: Optional[bool] = None,
-    subcluster: bool = False
+    subcluster: bool = False,
+    # --- NEW: naming/unify knobs ---
+    name_clusters: bool = False,
+    naming_fn: Optional[Callable[[List[str], List[str]], Optional[str]]] = None,
+    unify_names: bool = True,
+    confirm_pair_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> pd.DataFrame:
     """임베딩 벡터, 계정/클러스터 센트로이드, semantic_z(코사인 거리 z) 생성."""
     if df is None or df.empty: return df
@@ -2452,6 +2580,43 @@ def _add_semantic_features(
             .transform(_zseries)
             .astype(float)
     )
+    # --- NEW: cluster naming & synonym unification ---
+    if name_clusters:
+        names: Dict[int, str] = {}
+        for cid, sub in base.groupby('cluster_id'):
+            if int(cid) == -1:
+                names[int(cid)] = "클러스터 노이즈(-1)"; continue
+            descs = sub.get('적요', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()[:5]
+            vendors = sub.get('거래처', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()[:5]
+            cand = None
+            if naming_fn is not None:
+                try:
+                    cand = naming_fn(descs, vendors)
+                except Exception:
+                    cand = None
+            if not cand:
+                amt_tag = "규모 중간"
+                try:
+                    med_amt = sub.get('발생액', pd.Series(dtype=float)).abs().median()
+                    if float(med_amt) >= 1e8: amt_tag = "1억원 이상"
+                    elif float(med_amt) >= 1e7: amt_tag = "1천만~1억"
+                except Exception:
+                    pass
+                top_vendor = sub.get('거래처', pd.Series(dtype=str)).value_counts().index[:1].tolist()
+                cand = (top_vendor[0] + " / " + amt_tag) if top_vendor else ("기타 / " + amt_tag)
+            names[int(cid)] = cand
+        base['cluster_name'] = base['cluster_id'].map(names)
+        try:
+            from analysis.embedding import unify_cluster_names_with_llm
+            if unify_names:
+                base, _mapping = unify_cluster_names_with_llm(
+                    base, sim_threshold=0.90, emb_model=EMB_MODEL_SMALL,
+                    embed_texts_fn=embed_texts_fn, confirm_pair_fn=confirm_pair_fn
+                )
+            else:
+                base['cluster_group'] = base.get('cluster_name')
+        except Exception:
+            base['cluster_group'] = base.get('cluster_name')
     return base
 
 # ---------------------- NEW: Isolation Forest --------------------------
@@ -2581,6 +2746,11 @@ def run_anomaly_module(
     subcluster_enabled: bool = False,
     iforest_enabled: Optional[bool] = None,
     iforest_contamination: Optional[float] = None,
+    # --- NEW: naming/unify knobs ---
+    name_clusters: bool = False,
+    naming_fn=None,
+    unify_names: bool = True,
+    confirm_pair_fn=None,
 ):
     df = lf.df.copy()
     acct_col = find_column_by_keyword(df.columns, '계정코드')
@@ -2606,7 +2776,10 @@ def run_anomaly_module(
             df = _add_semantic_features(
                 df, acct_col=acct_col, embed_client=embed_client,
                 embed_texts_fn=embed_texts_fn, use_large=use_large_embedding,
-                subcluster=subcluster_enabled
+                subcluster=subcluster_enabled,
+                # --- NEW ---
+                name_clusters=name_clusters, naming_fn=naming_fn,
+                unify_names=unify_names, confirm_pair_fn=confirm_pair_fn,
             )
         except Exception:
             # 의미피처 실패해도 기본 Z-Score 흐름은 유지
@@ -2657,6 +2830,23 @@ def run_anomaly_module(
         if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
             if_top = df.sort_values('iforest_score', ascending=False).head(int(topn))
             tables["iforest_top"] = if_top[[c for c in out_cols if c in if_top.columns]]
+    except Exception:
+        pass
+
+    # (NEW) 클러스터 요약(선택)
+    try:
+        if 'cluster_name' in df.columns:
+            grp = df[df.get('cluster_id', 0) != -1].copy()
+            if not grp.empty:
+                agg = (
+                    grp.groupby(['cluster_group' if 'cluster_group' in grp.columns else 'cluster_name'])
+                       .agg(건수=('row_id','count'),
+                            금액합계=('발생액', lambda s: float(pd.to_numeric(s, errors='coerce').fillna(0).abs().sum())),
+                            대표계정=('계정명', lambda s: s.value_counts().index[:1].tolist()[0] if len(s) else ''))
+                       .reset_index()
+                       .rename(columns={'cluster_group':'클러스터(통합명)','cluster_name':'클러스터'})
+                )
+                tables['cluster_summary'] = agg.sort_values('금액합계', ascending=False).head(50)
     except Exception:
         pass
 
@@ -2723,23 +2913,35 @@ def run_anomaly_module(
         figures["zscore_hist"] = fig
     except Exception:
         pass
-    # (NEW) semantic_z / iforest_score 히스토그램
+    # (NEW) semantic_z / iforest_score 히스토그램 (Interval → 문자열 라벨로 직렬화 안정화)
     try:
         if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
             s = pd.to_numeric(df['semantic_z'], errors='coerce').dropna()
-            bins = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
-            cats = pd.cut(s, bins=bins, right=False)
-            sem_hist = cats.value_counts().sort_index().reset_index()
-            sem_hist.columns = ['구간','건수']
-            figures["semantic_hist"] = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+            edges = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
+            cats = pd.cut(s, bins=edges, right=False)
+            sem_hist = (
+                cats.value_counts().sort_index()
+                .rename_axis('구간').reset_index(name='건수')
+            )
+            sem_hist['구간'] = sem_hist['구간'].astype(str)
+            fig_sem = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+            fig_sem.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': sem_hist['구간'].tolist()})
+            figures["semantic_hist"] = fig_sem
     except Exception:
         pass
     try:
         if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
             sc = pd.to_numeric(df['iforest_score'], errors='coerce').dropna()
-            if_hist = pd.cut(sc, bins=[x/20 for x in range(0,21)], right=False).value_counts().sort_index().reset_index()
-            if_hist.columns = ['구간','건수']
-            figures["iforest_hist"] = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
+            edges = [x/20 for x in range(0, 21)]
+            labels = [f"[{edges[i]:.2f}, {edges[i+1]:.2f})" for i in range(len(edges)-1)]
+            cats = pd.cut(sc, bins=edges, right=False, labels=labels)
+            if_hist = (
+                cats.value_counts().reindex(labels, fill_value=0)
+                .rename_axis('구간').reset_index(name='건수')
+            )
+            fig_ifo = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
+            fig_ifo.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': if_hist['구간'].tolist()})
+            figures["iforest_hist"] = fig_ifo
     except Exception:
         pass
 
@@ -3104,6 +3306,7 @@ def run_correlation_module(
         aspect='auto',
         x=xn,
         y=yn,
+        color_continuous_scale="Blues",
     )
     fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
     fig.update_coloraxes(cmin=-1, cmax=1)
@@ -3305,11 +3508,17 @@ def _pivot_monthly_flow(lf: LedgerFrame, accounts: List[str]) -> pd.DataFrame:
 
 def _corr_with_lag(a: pd.Series, b: pd.Series, lag: int) -> float:
     if lag > 0:
-        return a.iloc[lag:].corr(b.iloc[:-lag])
+        a1, b1 = a.iloc[lag:], b.iloc[:-lag]
     elif lag < 0:
-        return a.iloc[:lag].corr(b.iloc[-lag:])
+        a1, b1 = a.iloc[:lag], b.iloc[-lag:]
     else:
-        return a.corr(b)
+        a1, b1 = a, b
+    # 둘 다 0인 월 제거 → 희소 데이터의 가짜 상관 방지
+    mask = ~((a1.fillna(0) == 0) & (b1.fillna(0) == 0))
+    a1, b1 = a1[mask], b1[mask]
+    if a1.count() < 3 or b1.count() < 3:
+        return np.nan
+    return a1.corr(b1)
 
 
 def _best_lag_pair(pivot: pd.DataFrame, max_lag: int) -> List[Dict[str, object]]:

@@ -1,13 +1,14 @@
 from __future__ import annotations
 import numpy as np, math
 import pandas as pd
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Callable
 from utils.helpers import find_column_by_keyword
 from analysis.embedding import ensure_rich_embedding_text, perform_embedding_only  # ← services 주입식 임베딩 사용
 from config import (
     IFOREST_ENABLED_DEFAULT, IFOREST_N_ESTIMATORS, IFOREST_MAX_SAMPLES,
     IFOREST_CONTAM_DEFAULT, IFOREST_RANDOM_STATE,
-    SEMANTIC_Z_THRESHOLD, SEMANTIC_MIN_RECORDS, ANOMALY_IFOREST_SCORE_THRESHOLD
+    SEMANTIC_Z_THRESHOLD, SEMANTIC_MIN_RECORDS, ANOMALY_IFOREST_SCORE_THRESHOLD,
+    EMB_MODEL_SMALL
 )
 
 
@@ -80,7 +81,12 @@ def _add_semantic_features(
     embed_client: Any,
     embed_texts_fn,              # injected (e.g., services.cache.get_or_embed_texts)
     use_large: Optional[bool] = None,
-    subcluster: bool = False
+    subcluster: bool = False,
+    # --- NEW: naming/unify knobs ---
+    name_clusters: bool = False,
+    naming_fn: Optional[Callable[[List[str], List[str]], Optional[str]]] = None,
+    unify_names: bool = True,
+    confirm_pair_fn: Optional[Callable[[str, str], bool]] = None,
 ) -> pd.DataFrame:
     """임베딩 벡터, 계정/클러스터 센트로이드, semantic_z(코사인 거리 z) 생성."""
     if df is None or df.empty: return df
@@ -121,6 +127,43 @@ def _add_semantic_features(
             .transform(_zseries)
             .astype(float)
     )
+    # --- NEW: cluster naming & synonym unification ---
+    if name_clusters:
+        names: Dict[int, str] = {}
+        for cid, sub in base.groupby('cluster_id'):
+            if int(cid) == -1:
+                names[int(cid)] = "클러스터 노이즈(-1)"; continue
+            descs = sub.get('적요', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()[:5]
+            vendors = sub.get('거래처', pd.Series(dtype=str)).dropna().astype(str).unique().tolist()[:5]
+            cand = None
+            if naming_fn is not None:
+                try:
+                    cand = naming_fn(descs, vendors)
+                except Exception:
+                    cand = None
+            if not cand:
+                amt_tag = "규모 중간"
+                try:
+                    med_amt = sub.get('발생액', pd.Series(dtype=float)).abs().median()
+                    if float(med_amt) >= 1e8: amt_tag = "1억원 이상"
+                    elif float(med_amt) >= 1e7: amt_tag = "1천만~1억"
+                except Exception:
+                    pass
+                top_vendor = sub.get('거래처', pd.Series(dtype=str)).value_counts().index[:1].tolist()
+                cand = (top_vendor[0] + " / " + amt_tag) if top_vendor else ("기타 / " + amt_tag)
+            names[int(cid)] = cand
+        base['cluster_name'] = base['cluster_id'].map(names)
+        try:
+            from analysis.embedding import unify_cluster_names_with_llm
+            if unify_names:
+                base, _mapping = unify_cluster_names_with_llm(
+                    base, sim_threshold=0.90, emb_model=EMB_MODEL_SMALL,
+                    embed_texts_fn=embed_texts_fn, confirm_pair_fn=confirm_pair_fn
+                )
+            else:
+                base['cluster_group'] = base.get('cluster_name')
+        except Exception:
+            base['cluster_group'] = base.get('cluster_name')
     return base
 
 # ---------------------- NEW: Isolation Forest --------------------------
@@ -250,6 +293,11 @@ def run_anomaly_module(
     subcluster_enabled: bool = False,
     iforest_enabled: Optional[bool] = None,
     iforest_contamination: Optional[float] = None,
+    # --- NEW: naming/unify knobs ---
+    name_clusters: bool = False,
+    naming_fn=None,
+    unify_names: bool = True,
+    confirm_pair_fn=None,
 ):
     df = lf.df.copy()
     acct_col = find_column_by_keyword(df.columns, '계정코드')
@@ -275,7 +323,10 @@ def run_anomaly_module(
             df = _add_semantic_features(
                 df, acct_col=acct_col, embed_client=embed_client,
                 embed_texts_fn=embed_texts_fn, use_large=use_large_embedding,
-                subcluster=subcluster_enabled
+                subcluster=subcluster_enabled,
+                # --- NEW ---
+                name_clusters=name_clusters, naming_fn=naming_fn,
+                unify_names=unify_names, confirm_pair_fn=confirm_pair_fn,
             )
         except Exception:
             # 의미피처 실패해도 기본 Z-Score 흐름은 유지
@@ -326,6 +377,23 @@ def run_anomaly_module(
         if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
             if_top = df.sort_values('iforest_score', ascending=False).head(int(topn))
             tables["iforest_top"] = if_top[[c for c in out_cols if c in if_top.columns]]
+    except Exception:
+        pass
+
+    # (NEW) 클러스터 요약(선택)
+    try:
+        if 'cluster_name' in df.columns:
+            grp = df[df.get('cluster_id', 0) != -1].copy()
+            if not grp.empty:
+                agg = (
+                    grp.groupby(['cluster_group' if 'cluster_group' in grp.columns else 'cluster_name'])
+                       .agg(건수=('row_id','count'),
+                            금액합계=('발생액', lambda s: float(pd.to_numeric(s, errors='coerce').fillna(0).abs().sum())),
+                            대표계정=('계정명', lambda s: s.value_counts().index[:1].tolist()[0] if len(s) else ''))
+                       .reset_index()
+                       .rename(columns={'cluster_group':'클러스터(통합명)','cluster_name':'클러스터'})
+                )
+                tables['cluster_summary'] = agg.sort_values('금액합계', ascending=False).head(50)
     except Exception:
         pass
 
@@ -392,23 +460,35 @@ def run_anomaly_module(
         figures["zscore_hist"] = fig
     except Exception:
         pass
-    # (NEW) semantic_z / iforest_score 히스토그램
+    # (NEW) semantic_z / iforest_score 히스토그램 (Interval → 문자열 라벨로 직렬화 안정화)
     try:
         if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
             s = pd.to_numeric(df['semantic_z'], errors='coerce').dropna()
-            bins = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
-            cats = pd.cut(s, bins=bins, right=False)
-            sem_hist = cats.value_counts().sort_index().reset_index()
-            sem_hist.columns = ['구간','건수']
-            figures["semantic_hist"] = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+            edges = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
+            cats = pd.cut(s, bins=edges, right=False)
+            sem_hist = (
+                cats.value_counts().sort_index()
+                .rename_axis('구간').reset_index(name='건수')
+            )
+            sem_hist['구간'] = sem_hist['구간'].astype(str)
+            fig_sem = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+            fig_sem.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': sem_hist['구간'].tolist()})
+            figures["semantic_hist"] = fig_sem
     except Exception:
         pass
     try:
         if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
             sc = pd.to_numeric(df['iforest_score'], errors='coerce').dropna()
-            if_hist = pd.cut(sc, bins=[x/20 for x in range(0,21)], right=False).value_counts().sort_index().reset_index()
-            if_hist.columns = ['구간','건수']
-            figures["iforest_hist"] = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
+            edges = [x/20 for x in range(0, 21)]
+            labels = [f"[{edges[i]:.2f}, {edges[i+1]:.2f})" for i in range(len(edges)-1)]
+            cats = pd.cut(sc, bins=edges, right=False, labels=labels)
+            if_hist = (
+                cats.value_counts().reindex(labels, fill_value=0)
+                .rename_axis('구간').reset_index(name='건수')
+            )
+            fig_ifo = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
+            fig_ifo.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': if_hist['구간'].tolist()})
+            figures["iforest_hist"] = fig_ifo
     except Exception:
         pass
 

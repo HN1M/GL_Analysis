@@ -47,7 +47,7 @@ from analysis.embedding import (
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
 from services.llm import LLMClient, openai_available
-from services.cache import get_or_embed_texts
+from services.cache import get_or_embed_texts, cache_get_many, get_cache_info
 import services.cycles_store as cyc
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU, EMB_MODEL_SMALL
 try:
@@ -57,6 +57,7 @@ except Exception:
     IFOREST_CONTAM_DEFAULT = 0.03
 from utils.viz import add_materiality_threshold, add_pm_badge
 from services.cluster_naming import (
+    make_llm_name_fn,
     make_synonym_confirm_fn,
     unify_cluster_labels_llm,
 )
@@ -143,6 +144,12 @@ def _render_corr_basic_tab(*, upload_id: str):
     mdf = st.session_state.master_df
     acct_names = sorted(mdf['계정명'].dropna().astype(str).unique().tolist())
     st.subheader("계정 간 상관 히트맵(기본)")
+    with st.expander("🧭 해석 가이드", expanded=False):
+        try:
+            from analysis.correlation import friendly_correlation_explainer
+            st.markdown(friendly_correlation_explainer() + "\n- 롤링 상관성: 최근 k개월씩 묶어 이동하며 본 상관의 평균(강도)과 표준편차(안정성) 입니다.\n\n평균이 높고 표준편차가 낮을수록 지속적 관계입니다.")
+        except Exception:
+            st.markdown("- 롤링 상관성: 최근 k개월씩 묶어 이동하며 본 상관의 평균(강도)과 표준편차(안정성) 입니다.\n\n평균이 높고 표준편차가 낮을수록 지속적 관계입니다.")
     # 버퍼 적용(위젯 생성 전)
     if st.session_state.get("corr_basic_accounts_needs_update") and st.session_state.get("corr_basic_accounts_buf"):
         st.session_state["corr_basic_accounts"] = list(st.session_state["corr_basic_accounts_buf"])  
@@ -308,6 +315,18 @@ def _render_corr_advanced_tab(*, upload_id: str):
                 max_lag=int(st.session_state.get("corr_adv_maxlag", 6)),
                 rolling_window=int(st.session_state.get("corr_adv_rollwin", 6)),
             )
+            with st.expander("🧭 해석 가이드", expanded=False):
+                st.markdown("""
+- **기본 상관**: 월별 **부호 포함** 발생액을 이용해 단순 피어슨 상관(시차 0)을 계산합니다.
+- **고급 상관**: 월별 **절대발생액(규모)** 피벗을 기준으로 상관을 계산하고,  
+  `최대 시차(개월)` 범위에서 **최적시차**를 탐색하며, `롤링 윈도우`로 **시간에 따른 상관의 안정성**(변동성)을 봅니다.
+- 두 결과가 다를 수 있는 이유:
+  1) 기본은 ‘방향(+,−)’을 반영 ⇒ 대체/상쇄 관계가 드러남  
+  2) 고급은 ‘규모(절대값)’을 반영 ⇒ **같이 크다/같이 작다** 패턴을 포착  
+  3) 시차/롤링을 쓰면 **시점 어긋남**이나 **일시적 관계**가 보정/드러납니다.
+- **롤링 상관성**: 일정 개월 창으로 이동하며 계산한 상관의 **평균과 표준편차**로 안정성을 봅니다.  
+  표준편차가 낮을수록 ‘관계가 안정적’입니다.
+""")
             st.subheader("히트맵")
             if "heatmap" in mr.figures:
                 st.plotly_chart(mr.figures["heatmap"], use_container_width=True)
@@ -882,36 +901,83 @@ if uploaded_file is not None:
                     st.header("이상 패턴 탐지")
                     st.caption("z-점수 외에도 임베딩 기반 의미분석과 Isolation Forest를 선택해 다각도로 탐지할 수 있습니다.")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
+                    with st.expander("🧭 해석 가이드", expanded=False):
+                        st.markdown(
+                            """
+이상 패턴 탐지, 어떻게 읽으면 좋을까요?
+
+- Z-Score: 같은 계정 안에서 “평소 금액”에서 얼마나 벗어났는지 본 지표예요. |Z|≈2면 이례적, |Z|≈3이면 매우 이례적입니다.
+
+- 의미(임베딩) 기반 이탈: 적요·거래처 문장을 벡터(숫자열)로 바꿔, 같은 계정/유사그룹(클러스터) 평균과 의미적으로 얼마나 다른지 봅니다. 같은 “복리후생비”인데 내용이 유난히 다른 거래가 위로 올라옵니다.
+
+- Isolation Forest: 금액, |Z|, 의미거리, 월 등 여러 특징을 종합해 이상 점수(0~1)를 계산합니다. 값이 1에 가까울수록 “여러 기준에서 동시에 튀었다”는 뜻입니다.
+
+- 클러스터 이름: 비슷한 거래끼리 묶고, 대표 적요/거래처로 짧은 한글 이름을 자동으로 붙입니다(옵션). 예: “직원 급여”, “정보통신비”, “복리후생—경조사”. 비슷한 이름은 하나로 묶어 더 보기 쉽게 정리합니다.
+
+실무 팁:
+- Z-Score 상단에서 금액이 큰 건을 먼저 보고,
+- 의미 이탈 Top에서 계정상 분류오류 가능성이 큰 건을,
+- IForest Top에서 여러 기준에서 동시에 튀는 건을 순서대로 점검하세요.
+- 클러스터 요약은 “이번 분기에 어떤 패턴이 많았는가”를 빠르게 훑을 때 유용합니다.
+                            """
+                        )
                     mdf = st.session_state.master_df
                     acct_names = mdf['계정명'].unique()
                     pick = st.multiselect("대상 계정 선택(미선택 시 자동 추천)", acct_names, default=[])
-                    topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=200, value=20, step=5)
+                    topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=500, value=20, step=10)
 
                     # --- NEW: 탐지 옵션 ---
                     opt1, opt2, opt3 = st.columns(3)
                     with opt1:
                         use_semantic = st.checkbox("임베딩 의미분석", value=True, help="OpenAI 키 필요. 적요/거래처 문장의 의미적 이탈을 포착합니다.")
-                    with opt2:
                         use_subcluster = st.checkbox("하위클러스터링", value=False, help="계정 내 유사 거래를 묶어 그룹별 이탈을 봅니다.")
-                    with opt3:
+                    with opt2:
                         use_iforest = st.checkbox("Isolation Forest", value=True, help="수치 특징(금액·|Z| 등)으로 비감독 이상치 탐지.")
-                    contam = st.slider("IForest contamination(이상 비율)", 0.01, 0.15, float(IFOREST_CONTAM_DEFAULT), 0.01, disabled=not use_iforest)
+                        contam = st.slider("IForest contamination(이상 비율)", 0.01, 0.20, float(IFOREST_CONTAM_DEFAULT), 0.01, disabled=not use_iforest)
+                    with opt3:
+                        # --- NEW: 클러스터 네이밍/동의어 통합 ---
+                        use_name = st.checkbox("클러스터 이름붙이기(LLM)", value=False, help="클러스터별 샘플 적요/거래처로 짧은 한글 이름 생성")
+                        use_unify = st.checkbox("이름 통합(동의어 묶기)", value=True, help="유사한 클러스터명을 하나로 묶음")
 
                     if st.button("이상치 분석 실행"):
                         lf_use = _lf_by_scope()
                         codes = None
                         if pick:
                             codes = mdf[mdf['계정명'].isin(pick)]['계정코드'].astype(str).tolist()
-                        # --- NEW: 임베딩 주입 준비(analysis 레이어는 services 직접 의존 금지 → UI에서 주입) ---
-                        embed_client = None
-                        embed_texts_fn = None
+                        # --- NEW: 임베딩 계측 래퍼 + 네이밍 콜백 준비 ---
+                        def embed_with_stats(texts, *, client=None, model=None, batch_size=64, timeout=60, max_retry=2):
+                            import time
+                            uniq = list(dict.fromkeys([str(t) for t in texts]))
+                            t0 = time.time()
+                            cached_before = cache_get_many(model, uniq) or {}
+                            mapping = get_or_embed_texts(
+                                uniq, client=client, model=model, batch_size=batch_size, timeout=timeout, max_retry=max_retry
+                            )
+                            elapsed = time.time() - t0
+                            hits = sum(1 for t in uniq if t in (cached_before or {}))
+                            api_calls = max(0, len(mapping) - hits)
+                            try:
+                                dim = len(next(iter(mapping.values()))) if mapping else 0
+                            except Exception:
+                                dim = 0
+                            st.session_state['last_embed_stats'] = {
+                                "model": model, "n_texts": len(uniq), "cache_hits": hits,
+                                "api_calls": api_calls, "dim": int(dim), "elapsed_sec": round(elapsed, 3),
+                            }
+                            return mapping
+
+                        embed_client, embed_texts_fn = None, None
+                        name_fn, confirm_fn = None, None
                         if use_semantic:
                             try:
                                 if openai_available():
                                     embed_client = LLMClient().client
-                                    embed_texts_fn = get_or_embed_texts
+                                    embed_texts_fn = embed_with_stats  # 계측 래퍼 주입
+                                    if use_name:
+                                        name_fn = make_llm_name_fn(embed_client, model="gpt-4o-mini")
+                                        confirm_fn = make_synonym_confirm_fn(embed_client, model="gpt-4o-mini") if use_unify else None
                                 else:
-                                    st.info("🔌 OpenAI Key가 없어 의미분석은 비활성화됩니다.")
+                                    st.info("🔌 OpenAI Key가 없어 의미분석/네이밍은 비활성화됩니다.")
                             except Exception as e:
                                 st.info(f"의미분석 준비 실패: {e}")
 
@@ -928,6 +994,9 @@ if uploaded_file is not None:
                             subcluster_enabled=bool(use_subcluster),
                             iforest_enabled=bool(use_iforest),
                             iforest_contamination=float(contam) if use_iforest else None,
+                            # --- NEW: 네이밍/통합 옵션 ---
+                            name_clusters=bool(use_name), naming_fn=name_fn,
+                            unify_names=bool(use_unify), confirm_pair_fn=confirm_fn,
                         )
                         _push_module(amod)
                         for w in amod.warnings: st.warning(w)
@@ -953,6 +1022,24 @@ if uploaded_file is not None:
                         if 'iforest_top' in amod.tables:
                             st.subheader("Isolation Forest Top")
                             st.dataframe(amod.tables['iforest_top'].style.format(fmt), use_container_width=True)
+
+                        # --- NEW: 클러스터 요약(금액 기준 상위) ---
+                        if 'cluster_summary' in amod.tables:
+                            st.subheader("클러스터 요약(금액 기준 상위)")
+                            _fmt = {'금액합계': '{:,0f}'}
+                            st.dataframe(amod.tables['cluster_summary'].style.format(_fmt), use_container_width=True)
+
+                        # --- NEW: 임베딩/AI 실행 상황판 ---
+                        with st.expander("🔎 임베딩/AI 실행 상황판", expanded=False):
+                            stats = st.session_state.get('last_embed_stats', {})
+                            cache_info = get_cache_info(stats.get("model") or "text-embedding-3-small")
+                            col1, col2, col3, col4, col5 = st.columns(5)
+                            col1.metric("임베딩 모델", stats.get("model", "-"))
+                            col2.metric("고유 텍스트 수", f"{stats.get('n_texts', 0):,}")
+                            col3.metric("캐시 히트", f"{stats.get('cache_hits', 0):,}")
+                            col4.metric("신규 API 콜", f"{stats.get('api_calls', 0):,}")
+                            col5.metric("차원/경과(s)", f"{stats.get('dim', 0)} / {stats.get('elapsed_sec', 0)}")
+                            st.caption(f"캐시 파일: {cache_info.get('path','-')} (rows={cache_info.get('rows','?'):,}, size={cache_info.get('size_bytes',0):,} bytes)")
 
                 with tab_ts:
                     st.header("시계열 예측")

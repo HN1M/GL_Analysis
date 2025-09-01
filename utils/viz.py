@@ -254,3 +254,46 @@ def add_period_guides(fig, x_series):
             continue
     return fig
 
+
+# === NEW: Correlation heatmap theming & explanation utilities ===
+def apply_corr_heatmap_theme(fig, *, title: str | None = None):
+    """
+    상관 히트맵 공통 테마 적용:
+    - 색상/스케일: Blues, [-1, 1]
+    - 축 타입: category
+    - 호버 템플릿: 계정명 × 계정명 + r 표시
+    """
+    if title:
+        fig.update_layout(title=title)
+    try:
+        fig.update_coloraxes(cmin=-1, cmax=1, colorscale="Blues", colorbar=dict(tickformat=".2f"))
+    except Exception:
+        pass
+    try:
+        fig.update_xaxes(type="category")
+        fig.update_yaxes(type="category")
+    except Exception:
+        pass
+    try:
+        fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
+    except Exception:
+        pass
+    return fig
+
+
+def narrate_corr_meaning(r_signed: float, r_abs: float, r_lag: float | None, lag: int | None) -> str:
+    """
+    기본(부호 포함) vs 고급(절대값/규모) vs 최적시차 결과를 자연어로 설명.
+    UI에서 특정 계정쌍 선택 시 보조 텍스트로 활용.
+    """
+    def _sgn(x: float) -> str:
+        return "양( + )" if float(x) >= 0 else "음( - )"
+
+    lines: list[str] = []
+    lines.append(f"- 기본 상관(부호포함): r={float(r_signed):+ .2f} → {'같이 오르고 내리는' if float(r_signed)>=0 else '한쪽↑ 다른쪽↓'} 경향.")
+    lines.append(f"- 고급 상관(규모/절대값): r={float(r_abs):+ .2f} → 금액 규모가 {'같이 커지거나 작아지는' if float(r_abs)>=0 else '규모 관점에서는 엇갈리는'} 경향.")
+    if lag is not None and r_lag is not None:
+        when = "A가 B보다" if int(lag) > 0 else "B가 A보다"
+        lines.append(f"- 최적시차: {int(lag):+d}개월 ⇒ {when} {abs(int(lag))}개월 선행/후행 시 상관 r={float(r_lag):+ .2f}.")
+    lines.append("※ 기본과 고급이 다르면: '방향 동행'(부호)과 '규모 동행'(절대값)이 다른 신호를 준다는 뜻입니다.")
+    return "\n".join(lines)

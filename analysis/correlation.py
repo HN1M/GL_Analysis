@@ -6,6 +6,7 @@ from typing import List, Dict, Any, Tuple, Optional, Mapping, Sequence
 import re
 from analysis.contracts import LedgerFrame, ModuleResult, EvidenceDetail
 from utils.helpers import find_column_by_keyword
+from utils.viz import apply_corr_heatmap_theme
 from config import (
     CORR_DEFAULT_METHOD, CORR_THRESHOLD_DEFAULT, CORR_MIN_ACTIVE_MONTHS_DEFAULT
 )
@@ -200,18 +201,20 @@ def run_correlation_module(
         aspect='auto',
         x=xn,
         y=yn,
+        color_continuous_scale="Blues",
     )
-    fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
-    fig.update_coloraxes(cmin=-1, cmax=1)
-    fig.update_xaxes(type='category')
-    fig.update_yaxes(type='category')
+    fig = apply_corr_heatmap_theme(fig)
 
     # 임계 상관쌍 테이블 (idempotent-safe)
     def build_strong_pairs(corr_matrix: pd.DataFrame, code_to_name: dict, threshold: float = 0.7) -> pd.DataFrame:
         import numpy as _np
         import pandas as _pd
-        mask = _np.triu(_np.ones_like(corr_matrix, dtype=bool), k=1)
-        cm = corr_matrix.copy().mask(mask)
+        cm = corr_matrix.copy()
+        # ① 대각선 제거
+        _np.fill_diagonal(cm.values, _np.nan)
+        # ② 상삼각 제거(중복 방지)
+        mask = _np.triu(_np.ones_like(cm, dtype=bool), k=1)
+        cm = cm.mask(mask)
         rows = []
         abs_vals = cm.abs().values
         idx_i, idx_j = _np.where(abs_vals >= threshold)

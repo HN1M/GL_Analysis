@@ -4,6 +4,7 @@ import pandas as pd
 from typing import List, Dict
 from analysis.contracts import ModuleResult, EvidenceDetail, LedgerFrame
 from config import CORR_THRESHOLD_DEFAULT, CORR_MAX_LAG_DEFAULT, CORR_ROLLWIN_DEFAULT
+from utils.viz import apply_corr_heatmap_theme
 import plotly.express as px
 
 
@@ -27,16 +28,22 @@ def _pivot_monthly_flow(lf: LedgerFrame, accounts: List[str]) -> pd.DataFrame:
     return pivot.sort_index()
 
 
-def _corr_with_lag(a: pd.Series, b: pd.Series, lag: int) -> float:
-    if lag > 0:
-        return a.iloc[lag:].corr(b.iloc[:-lag])
-    elif lag < 0:
-        return a.iloc[:lag].corr(b.iloc[-lag:])
-    else:
-        return a.corr(b)
+def _corr_with_lag(a: pd.Series, b: pd.Series, lag: int, *, min_overlap: int = 6) -> float:
+    """시차 상관: B를 lag만큼 shift해 A(t) vs B(t-lag).
+    - lag 음수면 반대 방향 이동
+    - 둘 다 0인 월 제거
+    - 유효 표본 길이(min_overlap) 미만이면 NaN
+    """
+    b_shift = b.shift(lag)
+    df = pd.concat([a, b_shift], axis=1, keys=["A", "B"]).copy()
+    df = df[(df["A"].fillna(0) != 0) | (df["B"].fillna(0) != 0)]
+    df = df.dropna()
+    if len(df) < int(min_overlap):
+        return np.nan
+    return float(df["A"].corr(df["B"]))
 
 
-def _best_lag_pair(pivot: pd.DataFrame, max_lag: int) -> List[Dict[str, object]]:
+def _best_lag_pair(pivot: pd.DataFrame, max_lag: int, *, min_overlap: int = 6) -> List[Dict[str, object]]:
     cols = list(pivot.columns)
     out: List[Dict[str, object]] = []
     for i in range(len(cols)):
@@ -44,7 +51,7 @@ def _best_lag_pair(pivot: pd.DataFrame, max_lag: int) -> List[Dict[str, object]]
             s1, s2 = pivot[cols[i]], pivot[cols[j]]
             best_lag, best_val = 0, np.nan
             for lag in range(-max_lag, max_lag + 1):
-                v = _corr_with_lag(s1, s2, lag)
+                v = _corr_with_lag(s1, s2, lag, min_overlap=min_overlap)
                 if not np.isnan(v) and (np.isnan(best_val) or abs(v) > abs(best_val)):
                     best_lag, best_val = lag, v
             if not np.isnan(best_val):
@@ -101,6 +108,7 @@ def run_corr_advanced(
         y=corr.index,
         title="계정 간 월별 상관 히트맵",
     )
+    fig_heat = apply_corr_heatmap_theme(fig_heat)
 
     # 임계치 이상 쌍
     strong: List[Dict[str, object]] = []
