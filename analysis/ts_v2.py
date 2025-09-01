@@ -16,9 +16,62 @@ def run_timeseries_minimal(df, *, account_name, date_col, amount_col, is_bs, ope
            .sort_values("date").reset_index(drop=True))
 
     y = g["amount"].astype(float)
-    span = max(3, min(6, len(y)))              # 짧은 시계열 가드
-    yhat = y.ewm(span=span, adjust=False).mean()
-    err  = y - yhat
+    
+    # === 미래구간 게이트(학습 N<6 → horizon=0) ===
+    n = int(len(y))
+    min_pts = 6
+    
+    # === MoR(자동 선택) 로그 노출(EMA vs MA 비교·선정 근거) ===
+    candidates = []
+    
+    # EMA 후보들
+    for alpha in [0.3, 0.5]:
+        span_ema = int(2/alpha - 1)
+        pred_ema = y.ewm(span=span_ema, adjust=False).mean().shift(1)
+        err_ema = y - pred_ema
+        mae_ema = err_ema.abs().mean()
+        mape_ema = (err_ema.abs() / y.abs().replace(0, np.nan)).mean() * 100
+        candidates.append({
+            'name': f'EMA(α={alpha})',
+            'pred': pred_ema,
+            'mae': mae_ema,
+            'mape': mape_ema if not np.isnan(mape_ema) else 999.0
+        })
+    
+    # MA 후보들
+    for w in [3, 6]:
+        if len(y) >= w:
+            pred_ma = y.rolling(window=w).mean().shift(1)
+            err_ma = y - pred_ma
+            mae_ma = err_ma.abs().mean()
+            mape_ma = (err_ma.abs() / y.abs().replace(0, np.nan)).mean() * 100
+            candidates.append({
+                'name': f'MA({w})',
+                'pred': pred_ma,
+                'mae': mae_ma,
+                'mape': mape_ma if not np.isnan(mape_ma) else 999.0
+            })
+    
+    # 최적 선택: MAPE 최소 (tie -> 작은 MAE)
+    best = min(candidates, key=lambda x: (x['mape'], x['mae']))
+    winner_name = best['name']
+    best_mape = best['mape']
+    best_mae = best['mae']
+    
+    # MoR 로그 생성
+    mor_log = {
+        "winner": winner_name,
+        "metric": "MAPE",
+        "mape_best": float(best_mape),
+        "mae_best": float(best_mae),
+        "n_months": n,
+        "used": winner_name
+    }
+    
+    # 선택된 예측값 사용
+    pred_flow = best['pred'] if n >= min_pts else y  # 포인트 부족시 완전 in-sample
+    
+    err  = y - pred_flow
     sig  = err.rolling(window=min(6, max(2, len(err))), min_periods=2).std(ddof=0)
     z    = err / sig.replace(0, np.nan)
 
@@ -30,32 +83,66 @@ def run_timeseries_minimal(df, *, account_name, date_col, amount_col, is_bs, ope
         account=str(account_name),
         measure="flow",
         actual=y.values,
-        predicted=yhat.values,
+        predicted=pred_flow.values,
         error=err.values,
         z=z.values,
         risk=risk.values,
-        model="EMA",
+        model=winner_name,  # 표/툴팁에 노출
     )
 
     if is_bs:
+        # === Balance 안전가드: opening + 누적만 사용 ===
+        # opening 없으면 0.0 (안전가드)
+        opening_safe = 0.0 if opening is None or pd.isna(opening) else float(opening)
+        
+        # flow_actual: 월별 합계(부호보정 포함) 시리즈
+        flow_actual = flow["actual"].astype(float)
+        flow_pred = flow["predicted"].astype(float)
+        
+        # Balance는 opening + cumsum(flow)만 사용
+        balance_actual = opening_safe + flow_actual.cumsum()
+        balance_pred = opening_safe + flow_pred.cumsum()
+        
         bal = flow.copy()
-        bal["measure"]   = "balance"
-        bal["actual"]    = float(opening) + bal["actual"].cumsum()
-        bal["predicted"] = float(opening) + bal["predicted"].cumsum()
-        bal["error"]     = bal["actual"] - bal["predicted"]
-        bal_sig          = bal["error"].rolling(window=min(6, max(2, len(bal))), min_periods=2).std(ddof=0)
-        bal["z"]         = bal["error"] / bal_sig.replace(0, np.nan)
+        bal["measure"] = "balance"
+        bal["actual"] = balance_actual.values
+        bal["predicted"] = balance_pred.values
+        bal["error"] = bal["actual"] - bal["predicted"]
+        
+        # balance error/z/risk는 flow와 동일 로직으로 파생(표준화 창 동일 k=6)
+        bal_sig = bal["error"].rolling(window=min(6, max(2, len(bal))), min_periods=2).std(ddof=0)
+        bal["z"] = bal["error"] / bal_sig.replace(0, np.nan)
+        bal["risk"] = np.minimum(1.0, 0.5 * (bal["z"].abs() / 3.0) + 0.2 * (bal["actual"].abs() > float(pm_value)).astype(float))
+        
         out = pd.concat([flow, bal], ignore_index=True)
     else:
         out = flow
 
-    # === 형 강제: Index 누출 방지 ===
-    out["date"] = pd.to_datetime(out["date"], errors="coerce")
-    for c in ["actual","predicted","error","z","risk"]:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
+    # === 출력 스키마 계약(Contract) 고정 + 날짜 정규화 ===
+    # 필수 9컬럼 보장
+    need_cols = ["date","account","measure","actual","predicted","error","z","risk","model"]
+    for c in need_cols:
+        if c not in out.columns:
+            out[c] = np.nan
+
+    # 날짜 정규화 (월말 00:00:00)
+    out["date"] = month_end_00(pd.to_datetime(out["date"], errors="coerce"))
+
+    # 숫자형 강제(표 포맷/다운로드 안정)
+    num_cols = ["actual","predicted","error","z","risk"]
+    out[num_cols] = out[num_cols].apply(pd.to_numeric, errors="coerce")
+    
+    # 문자형 강제
     out["model"]   = out["model"].astype(str)
     out["measure"] = out["measure"].astype(str)
     out["account"] = out["account"].astype(str)
+
+    # 컬럼 순서 강제
+    out = out[need_cols]
+    
+    # MoR 로그를 attrs에 저장
+    out.attrs["mor_log"] = mor_log
+    
     return out.reset_index(drop=True)
 
 

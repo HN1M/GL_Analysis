@@ -123,6 +123,181 @@ def _apply_cycles_to_picker(*, upload_id: str, cycles_state_key: str, accounts_s
     st.session_state[accounts_state_key] = sorted(cur.union(names))
 
 
+# --- NEW: Correlation UI helpers (DRY) ---
+from analysis.correlation import run_correlation_module  # 표준(기본) 상관 모듈
+
+def _render_corr_basic_tab(*, upload_id: str):
+    """
+    기본 상관관계 분석(히트맵/강한 상관쌍/제외계정)을 렌더합니다.
+    - 기존 '데이터 무결성 및 흐름' 탭의 구현을 그대로 옮겨, 상관 탭의 '기본' 서브탭에서 사용.
+    - state key는 'corr_basic_*' 네임스페이스로 충돌 방지.
+    """
+    import services.cycles_store as cyc
+    mdf = st.session_state.master_df
+    acct_names = sorted(mdf['계정명'].dropna().astype(str).unique().tolist())
+    st.subheader("계정 간 상관 히트맵(기본)")
+    colA, colB = st.columns([2,1])
+    with colA:
+        picked_accounts = st.multiselect(
+            "상관 분석 대상 계정(2개 이상 선택)",
+            acct_names,
+            default=[],
+            help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다.",
+            key="corr_basic_accounts"
+        )
+    with colB:
+        cycles_map_now = cyc.get_effective_cycles(upload_id)
+        if cycles_map_now:
+            picked_cycles = st.multiselect(
+                "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
+                default=[], key="corr_basic_cycles"
+            )
+            st.button("➕ 프리셋 적용", key="btn_apply_cycles_corr_basic", on_click=_apply_cycles_to_picker,
+                      kwargs=dict(upload_id=upload_id,
+                                  cycles_state_key="corr_basic_cycles",
+                                  accounts_state_key="corr_basic_accounts",
+                                  master_df=st.session_state.master_df))
+    corr_thr = st.slider(
+        "상관 임계치(강한 상관쌍 표 전용)",
+        min_value=0.50, max_value=0.95, step=0.05, value=0.70,
+        help="절대값 기준 임계치 이상인 계정쌍만 표에 표시합니다.",
+        key="corr_basic_thr"
+    )
+
+    if len(picked_accounts) < 2:
+        st.info("계정을 **2개 이상** 선택하면 히트맵이 표시됩니다.")
+        return
+
+    # 스코프 적용된 LedgerFrame을 재사용
+    lf_use = _lf_by_scope()
+
+    # 계정명 → 코드
+    codes = (
+        mdf[mdf['계정명'].isin(picked_accounts)]['계정코드']
+        .astype(str).tolist()
+    )
+    cmod = run_correlation_module(
+        lf_use,
+        accounts=codes,
+        corr_threshold=float(corr_thr),
+        cycles_map=cyc.get_effective_cycles(upload_id),
+    )
+    _push_module(cmod)
+    for w in cmod.warnings:
+        st.warning(w)
+
+    # 히트맵(+호버 계정명)
+    if 'heatmap' in cmod.figures:
+        fig = cmod.figures['heatmap']
+        try:
+            name_map = dict(zip(
+                mdf["계정코드"].astype(str),
+                mdf["계정명"].astype(str)
+            ))
+            tr = fig.data[0]
+            x_codes = list(map(str, getattr(tr, 'x', [])))
+            y_codes = list(map(str, getattr(tr, 'y', [])))
+            x_names = [name_map.get(c, c) for c in x_codes]
+            y_names = [name_map.get(c, c) for c in y_codes]
+            tr.update(x=x_names, y=y_names)
+            fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
+        except Exception:
+            pass
+        st.plotly_chart(fig, use_container_width=True, key=f"corr_basic_heatmap_{'_'.join(codes)}_{int(corr_thr*100)}")
+
+    # 임계치 이상 상관쌍
+    if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
+        st.markdown("**임계치 이상 상관쌍**")
+        st.dataframe(cmod.tables['strong_pairs'], use_container_width=True, height=320)
+
+    # 제외된 계정
+    if 'excluded_accounts' in cmod.tables and not cmod.tables['excluded_accounts'].empty:
+        with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
+            exc = cmod.tables['excluded_accounts'].copy()
+            if '계정코드' in exc.columns:
+                name_map = dict(zip(
+                    mdf["계정코드"].astype(str),
+                    mdf["계정명"].astype(str)
+                ))
+                exc['계정코드'] = exc['계정코드'].astype(str)
+                exc['계정명'] = exc['계정코드'].map(name_map)
+                cols = ['계정명', '계정코드'] + [c for c in exc.columns if c not in ('계정명','계정코드')]
+                exc = exc[cols]
+            st.dataframe(exc, use_container_width=True)
+
+
+def _render_corr_advanced_tab(*, upload_id: str):
+    """
+    고급 상관관계 분석(방법/시차/롤링 안정성 등)을 렌더합니다.
+    - 기존 '상관관계(고급)' 탭의 코드를 서브탭용 함수로 모듈화.
+    - state key는 기존 'corr_adv_*' 유지(호환).
+    """
+    import services.cycles_store as cyc
+    st.subheader("고급 상관관계")
+    lf_adv = _lf_by_scope()  # 스코프 일관성 유지
+    if lf_adv is None:
+        st.info("원장을 먼저 업로드해 주세요.")
+        return
+
+    mdf_adv = st.session_state.master_df
+    acct_names_adv = sorted(mdf_adv['계정명'].dropna().astype(str).unique().tolist())
+    colA, colB = st.columns(2)
+    with colA:
+        picked_accounts_adv = st.multiselect("분석 계정(다중 선택)", options=acct_names_adv, key="corr_adv_accounts")
+    with colB:
+        picked_cycles_adv = st.multiselect("사이클 프리셋(선택 시 계정 자동 반영)", options=list(cyc.CYCLE_KO.values()), key="corr_adv_cycles")
+        if st.button("프리셋 적용", key="btn_apply_preset_corr_adv"):
+            mapping = cyc.get_effective_cycles(upload_id)
+            codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles_adv)
+            code_to_name = (
+                mdf_adv[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
+                    .set_index('계정코드')['계정명'].astype(str).to_dict()
+            )
+            cur_set = set(st.session_state.get("corr_adv_accounts", []))
+            cur_set.update({code_to_name.get(c, c) for c in codes})
+            st.session_state["corr_adv_accounts"] = sorted(cur_set)
+
+    method = st.selectbox("상관 방식", ["pearson", "spearman", "kendall"], index=0, key="corr_adv_method")
+    corr_threshold = st.slider("임계치(|r|)", 0.1, 0.95, 0.70, 0.05, key="corr_adv_thr")
+    c1, c2 = st.columns(2)
+    with c1:
+        max_lag = st.slider("최대 시차(개월)", 0, 12, 6, 1, key="corr_adv_maxlag")
+    with c2:
+        rolling_window = st.slider("롤링 윈도우(개월)", 3, 24, 6, 1, key="corr_adv_rollwin")
+
+    if st.button("분석 실행", key="run_corr_adv"):
+        try:
+            from analysis.corr_advanced import run_corr_advanced as run_corr_adv
+            # ✅ UI(계정명) → 코드 변환
+            _names = st.session_state.get("corr_adv_accounts", picked_accounts_adv) or []
+            _codes = (
+                mdf_adv[mdf_adv['계정명'].isin(_names)]['계정코드']
+                .astype(str).drop_duplicates().tolist()
+            )
+            mr = run_corr_adv(
+                lf_adv,
+                _codes,
+                method=st.session_state.get("corr_adv_method", "pearson"),
+                corr_threshold=float(st.session_state.get("corr_adv_thr", 0.70)),
+                max_lag=int(st.session_state.get("corr_adv_maxlag", 6)),
+                rolling_window=int(st.session_state.get("corr_adv_rollwin", 6)),
+            )
+            st.subheader("히트맵")
+            if "heatmap" in mr.figures:
+                st.plotly_chart(mr.figures["heatmap"], use_container_width=True)
+            if "strong_pairs" in mr.tables:
+                st.subheader("임계치 이상 상관쌍")
+                st.dataframe(mr.tables["strong_pairs"], use_container_width=True)
+            if "lagged_pairs" in mr.tables:
+                st.subheader("최적 시차 상관(Top)")
+                st.dataframe(mr.tables["lagged_pairs"], use_container_width=True)
+            if "rolling_stability" in mr.tables:
+                st.subheader("롤링 안정성(변동성 낮은 순)")
+                st.dataframe(mr.tables["rolling_stability"], use_container_width=True)
+        except Exception as _e:
+            st.warning(f"고급 상관 분석 실패: {_e}")
+
+
 # --- 3. UI 부분 ---
 st.set_page_config(page_title="AI 분석 시스템 v0.18", layout="wide")
 st.title("훈's GL분석 시스템")
@@ -459,7 +634,7 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report, tab_corr_adv = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🧠 분석 종합 대시보드", "📊 상관관계(고급)"])
+                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report, tab_corr = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🧠 분석 종합 대시보드", "📊 상관관계"])
 
                 # (이전 버전) 대시보드 탭은 사용자 요청으로 제거됨
                 with tab_integrity:  # ...
@@ -535,88 +710,7 @@ if uploaded_file is not None:
 
                     st.markdown("---")
                     st.subheader("3. 계정 간 상관 히트맵")
-                    # ✅ 버튼 없이 즉시 렌더: 계정 2개 이상 선택 + 임계치 슬라이더 제공
-                    corr_accounts = st.multiselect(
-                        "상관 분석 대상 계정(2개 이상 선택)",
-                        account_list,
-                        default=selected_accounts,
-                        help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다.",
-                        key="corr_accounts_pick"
-                    )
-                    cycles_map_now = cyc.get_effective_cycles(upload_id)
-                    if cycles_map_now:
-                        picked_cycles_corr = st.multiselect(
-                            "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
-                            default=[], key="corr_cycles_pick"
-                        )
-                        st.button("➕ 프리셋 적용", key="btn_apply_cycles_corr", on_click=_apply_cycles_to_picker,
-                                  kwargs=dict(upload_id=upload_id,
-                                              cycles_state_key="corr_cycles_pick",
-                                              accounts_state_key="corr_accounts_pick",
-                                              master_df=st.session_state.master_df))
-                    corr_thr = st.slider(
-                        "상관 임계치(강한 상관쌍 표 전용)",
-                        min_value=0.50, max_value=0.95, step=0.05, value=0.70,
-                        help="절대값 기준 임계치 이상인 계정쌍만 표에 표시합니다."
-                    )
-                    if len(corr_accounts) < 2:
-                        st.info("계정을 **2개 이상** 선택하면 히트맵이 표시됩니다.")
-                    else:
-                        lf_use = _lf_by_scope()
-                        mdf = st.session_state.master_df
-                        codes = mdf[mdf['계정명'].isin(st.session_state["corr_accounts_pick"])]['계정코드'].astype(str).tolist()
-                        cmod = run_correlation_module(
-                            lf_use,
-                            accounts=codes,
-                            corr_threshold=float(corr_thr),
-                            cycles_map=cyc.get_effective_cycles(upload_id),
-                        )
-                        _push_module(cmod)
-                        for w in cmod.warnings:
-                            st.warning(w)
-                        if cmod.figures:
-                            stable_codes = "_".join(map(str, codes)) or "all"
-                            stable_thr = str(int(corr_thr*100))
-                            if 'heatmap' in cmod.figures:
-                                fig = cmod.figures['heatmap']
-                                try:
-                                    name_map = dict(zip(
-                                        mdf["계정코드"].astype(str),
-                                        mdf["계정명"].astype(str)
-                                    ))
-                                    tr = fig.data[0]
-                                    x_codes = list(map(str, getattr(tr, 'x', [])))
-                                    y_codes = list(map(str, getattr(tr, 'y', [])))
-                                    x_names = [name_map.get(c, c) for c in x_codes]
-                                    y_names = [name_map.get(c, c) for c in y_codes]
-                                    # x/y를 계정명으로 치환 → 호버에도 계정명이 노출됨
-                                    tr.update(x=x_names, y=y_names)
-                                    fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
-                                except Exception:
-                                    pass
-                                st.plotly_chart(
-                                    fig,
-                                    use_container_width=True,
-                                    key=f"corr_heatmap_{stable_codes}_{stable_thr}"
-                                )
-                        if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
-                            st.markdown("**임계치 이상 상관쌍**")
-                            sp = cmod.tables['strong_pairs'].copy()
-                            # 이미 correlation 모듈에서 계정명 컬럼을 assign으로 생성하므로 그대로 표시
-                            st.dataframe(sp, use_container_width=True, height=320)
-                        if 'excluded_accounts' in cmod.tables and not cmod.tables['excluded_accounts'].empty:
-                            with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
-                                exc = cmod.tables['excluded_accounts'].copy()
-                                if '계정코드' in exc.columns:
-                                    name_map = dict(zip(
-                                        mdf["계정코드"].astype(str),
-                                        mdf["계정명"].astype(str)
-                                    ))
-                                    exc['계정코드'] = exc['계정코드'].astype(str)
-                                    exc['계정명'] = exc['계정코드'].map(name_map)
-                                    cols = ['계정명', '계정코드'] + [c for c in exc.columns if c not in ('계정명','계정코드')]
-                                    exc = exc[cols]
-                                st.dataframe(exc, use_container_width=True)
+                    st.info("이 기능은 상단의 **📊 상관관계 → '기본' 서브탭**으로 이동했습니다.")
 
                 with tab_vendor:
                     st.header("거래처 심층 분석")
@@ -836,7 +930,7 @@ if uploaded_file is not None:
                     forecast_horizon = st.slider(
                         "미래 예측 개월 수(시각화용)", min_value=0, max_value=12, value=0, step=1,
                         help="표본 N<6이면 자동으로 0으로 비활성화됩니다."
-                    )
+                        )
 
                     if not picked_names:
                         st.info("시계열 결과가 없습니다. (선택한 계정/기간에 데이터 없음)")
@@ -993,9 +1087,9 @@ if uploaded_file is not None:
 
                         # 사용자 친화 라벨/정렬
                         tbl = (tbl.rename(columns={
-                                "date":"일자","actual":"실측","predicted":"예측",
-                                "error":"잔차","risk":"위험도","model":"모델(MoR)"
-                            })
+                            "date":"일자","actual":"실측","predicted":"예측",
+                            "error":"잔차","risk":"위험도","model":"모델(MoR)"
+                        })
                             .sort_values(["계정","일자"])
                         )
 
@@ -1020,6 +1114,13 @@ if uploaded_file is not None:
                             file_name=f"timeseries_summary_{'flow' if 'Flow' in title else 'balance'}.csv",
                             mime="text/csv"
                         )
+
+                    def _auto_height(df: pd.DataFrame, max_rows: int = 12) -> int:
+                        rows = int(min(len(df), max_rows))
+                        base_row = 34  # 체감값
+                        header = 38
+                        pad = 8
+                        return header + rows * base_row + pad
 
                     def _render_table_combined(flow_blocks, balance_blocks, title="선택계정 요약 (Flow+Balance)"):
                         import pandas as pd
@@ -1051,49 +1152,54 @@ if uploaded_file is not None:
                         if f is not None: blocks.append(f)
                         if b is not None: blocks.append(b)
                         if not blocks:
-                            return
+                                return
 
                         tbl = pd.concat(blocks, ignore_index=True)
 
                         # 중복 컬럼 제거 (혹시 있다면)
                         tbl = tbl.loc[:, ~tbl.columns.duplicated()]
 
-                        want_cols = ["기준", "계정", "일자", "실측", "예측", "잔차", "z", "위험도", "모델(MoR)"]
+                        # ✅ z 라벨 변경(표에서만)
+                        col_map = {
+                            "date":"일자","actual":"실측","predicted":"예측","error":"잔차",
+                            "z":"z(시계열)","risk":"위험도","model":"모델(MoR)"
+                        }
+                        for k, v in col_map.items():
+                            if k in tbl.columns:
+                                tbl.rename(columns={k: v}, inplace=True)
+
+                        want_cols = ["기준", "계정", "일자", "실측", "예측", "잔차", "z(시계열)", "위험도", "모델(MoR)"]
                         show_cols = [c for c in want_cols if c in tbl.columns]
                         tbl = tbl[show_cols].copy()
 
                         # 포맷
-                        fmt = {}
-                        for c in ["실측", "예측", "잔차"]:
-                            if c in tbl.columns: fmt[c] = "{:,.0f}"
-                        if "z" in tbl.columns: fmt["z"] = "{:.2f}"
-                        if "위험도" in tbl.columns: fmt["위험도"] = "{:.2f}"
+                        fmt = {"실측":"{:,.0f}","예측":"{:,.0f}","잔차":"{:,.0f}","위험도":"{:.2f}","z(시계열)":"{:.2f}"}
 
                         st.subheader(title)
 
-                        # 인덱스 숨김 (버전 호환: 실패 시 reset_index로 대체)
-                        tbl = tbl.reset_index(drop=True)  # 인덱스 확실히 제거
+                        # 인덱스 숨김 + 통일된 높이
+                        tbl = tbl.reset_index(drop=True)
                         try:
                             st.dataframe(
                                 tbl.style.format(fmt),
                                 use_container_width=True,
                                 hide_index=True,
-                                height=min(360, 44 + 32 * max(1, len(tbl)))
+                                height=_auto_height(tbl)
                             )
                         except TypeError:
                             st.dataframe(
                                 tbl.style.format(fmt),
                                 use_container_width=True,
-                                height=min(360, 44 + 32 * max(1, len(tbl)))
+                                height=_auto_height(tbl)
                             )
 
                         # CSV
-                        st.download_button(
+                            st.download_button(
                             "CSV 다운로드",
                             data=tbl.to_csv(index=False).encode("utf-8-sig"),
                             file_name="timeseries_summary_all.csv",
-                            mime="text/csv"
-                        )
+                                mime="text/csv"
+                            )
 
                     def _render_outlier_alert(results_per_account: dict, *, topn: int = 10, z_thr: float = 2.0):
                         """
@@ -1137,35 +1243,31 @@ if uploaded_file is not None:
                             ascending=[False, False]
                         ).head(int(topn))
 
-                        # 표시 컬럼/한글명
+                        # 표시 컬럼/한글명 + z 라벨 변경
                         rename = {"date": "일자", "actual": "실측", "predicted": "예측",
-                                  "error": "잔차", "risk": "위험도", "model": "모델"}
+                                  "error": "잔차", "z": "z(시계열)", "risk": "위험도", "model": "모델"}
                         for k, v in rename.items():
                             if k in out.columns:
                                 out.rename(columns={k: v}, inplace=True)
 
-                        show_cols = [c for c in ["계정", "일자", "실측", "예측", "잔차", "z", "위험도", "모델", "기준"] if c in out.columns]
+                        show_cols = [c for c in ["계정", "일자", "실측", "예측", "잔차", "z(시계열)", "위험도", "모델", "기준"] if c in out.columns]
                         out = out[show_cols]
 
-                        fmt = {}
-                        for c in ["실측", "예측", "잔차"]:
-                            if c in out.columns: fmt[c] = "{:,.0f}"
-                        if "z" in out.columns: fmt["z"] = "{:.2f}"
-                        if "위험도" in out.columns: fmt["위험도"] = "{:.2f}"
+                        fmt = {"실측":"{:,.0f}","예측":"{:,.0f}","잔차":"{:,.0f}","위험도":"{:.2f}","z(시계열)":"{:.2f}"}
 
                         try:
                             st.dataframe(
                                 out.style.format(fmt),
                                 use_container_width=True,
                                 hide_index=True,
-                                height=min(44 + 32 * max(1, len(out)), 360)
+                                height=_auto_height(out)
                             )
                         except TypeError:
                             # Streamlit 구버전 호환
                             st.dataframe(
                                 out.reset_index(drop=True).style.format(fmt),
                                 use_container_width=True,
-                                height=min(44 + 32 * max(1, len(out)), 360)
+                                height=_auto_height(out)
                             )
 
                     # === NEW: 선택계정 통계 및 이상월 리스트 렌더링 함수 정의 ===
@@ -1366,73 +1468,27 @@ if uploaded_file is not None:
                             if fig is not None:
                                 st.plotly_chart(fig, use_container_width=True)
 
-                            if stats_d:
+                            # MoR 로그 표시
+                            log = (results_per_account.get(acc_name, pd.DataFrame())).attrs.get("mor_log", {})
+                            if stats_d or log:
                                 st.caption(
-                                    f"모형:{dfm.get('model','').iloc[-1] if not dfm.empty else '-'} · "
-                                    f"정상성:{stats_d.get('diagnostics',{}).get('stationary')} · "
-                                    f"계절성:{stats_d.get('diagnostics',{}).get('seasonality')} · "
-                                    f"표본월:{stats_d.get('diagnostics',{}).get('n_months')}"
+                                    f"모형:{dfm['model'].iloc[-1] if not dfm.empty else '-'} · "
+                                    f"선정근거:{log.get('metric','-')} "
+                                    f"(MAPE={log.get('mape_best',''):g}%, MAE={log.get('mae_best',''):,.0f}) · "
+                                    f"표본월:{log.get('n_months','-')}"
                                     + ("" if _hz == forecast_horizon else " · (표본 부족으로 미래음영 비활성)")
                                 )
                 # ⚠️ 기존 tab5(위험평가) 블록 전체 삭제됨
                 
-                with tab_corr_adv:
-                    st.header("상관관계(고급)")
-                    lf_adv = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
-                    if lf_adv is None:
-                        st.info("원장을 먼저 업로드해 주세요.")
-                    else:
-                        mdf_adv = st.session_state.master_df
-                        acct_names_adv = sorted(mdf_adv['계정명'].dropna().astype(str).unique().tolist())
-                        colA, colB = st.columns(2)
-                        with colA:
-                            picked_accounts_adv = st.multiselect("분석 계정(다중 선택)", options=acct_names_adv, key="corr_adv_accounts")
-                        with colB:
-                            picked_cycles_adv = st.multiselect("사이클 프리셋(선택 시 계정 자동 반영)", options=list(cyc.CYCLE_KO.values()), key="corr_adv_cycles")
-                            if st.button("프리셋 적용", key="btn_apply_preset_corr_adv"):
-                                mapping = cyc.get_effective_cycles(getattr(uploaded_file, 'name', '_default'))
-                                codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles_adv)
-                                code_to_name = (
-                                    mdf_adv[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
-                                        .set_index('계정코드')['계정명'].astype(str).to_dict()
-                                )
-                                cur_set = set(st.session_state.get("corr_adv_accounts", []))
-                                cur_set.update({code_to_name.get(c, c) for c in codes})
-                                st.session_state["corr_adv_accounts"] = sorted(cur_set)
-
-                        method = st.selectbox("상관 방식", ["pearson", "spearman", "kendall"], index=0, key="corr_adv_method")
-                        corr_threshold = st.slider("임계치(|r|)", 0.1, 0.95, 0.70, 0.05, key="corr_adv_thr")
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            max_lag = st.slider("최대 시차(개월)", 0, 12, 6, 1, key="corr_adv_maxlag")
-                        with c2:
-                            rolling_window = st.slider("롤링 윈도우(개월)", 3, 24, 6, 1, key="corr_adv_rollwin")
-
-                        if st.button("분석 실행", key="run_corr_adv"):
-                            try:
-                                from analysis.corr_advanced import run_corr_advanced as run_corr_adv
-                                mr = run_corr_adv(
-                                    lf_adv,
-                                    st.session_state.get("corr_adv_accounts", picked_accounts_adv) or [],
-                                    method=st.session_state.get("corr_adv_method", "pearson"),
-                                    corr_threshold=float(st.session_state.get("corr_adv_thr", 0.70)),
-                                    max_lag=int(st.session_state.get("corr_adv_maxlag", 6)),
-                                    rolling_window=int(st.session_state.get("corr_adv_rollwin", 6)),
-                                )
-                                st.subheader("히트맵")
-                                if "heatmap" in mr.figures:
-                                    st.plotly_chart(mr.figures["heatmap"], use_container_width=True)
-                                if "strong_pairs" in mr.tables:
-                                    st.subheader("임계치 이상 상관쌍")
-                                    st.dataframe(mr.tables["strong_pairs"], use_container_width=True)
-                                if "lagged_pairs" in mr.tables:
-                                    st.subheader("최적 시차 상관(Top)")
-                                    st.dataframe(mr.tables["lagged_pairs"], use_container_width=True)
-                                if "rolling_stability" in mr.tables:
-                                    st.subheader("롤링 안정성(변동성 낮은 순)")
-                                    st.dataframe(mr.tables["rolling_stability"], use_container_width=True)
-                            except Exception as _e:
-                                st.warning(f"고급 상관 분석 실패: {_e}")
+                with tab_corr:
+                    st.header("상관관계")
+                    upload_id = getattr(uploaded_file, 'name', '_default')
+                    # 한 탭 내 순차 렌더(서브탭 사용 금지)
+                    st.subheader("기본 상관관계")
+                    _render_corr_basic_tab(upload_id=upload_id)
+                    st.markdown("---")
+                    st.subheader("고급 상관관계")
+                    _render_corr_advanced_tab(upload_id=upload_id)
                 with tab_report:
                     st.header("🧠 분석 종합 대시보드")
                     # --- Preview: modules session quick view ---

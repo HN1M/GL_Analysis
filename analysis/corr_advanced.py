@@ -7,8 +7,19 @@ import plotly.express as px
 
 
 def _pivot_monthly_flow(lf: LedgerFrame, accounts: List[str]) -> pd.DataFrame:
+    """
+    입력 accounts 가 '계정코드' 또는 '계정명' 어느 쪽이든 동작하도록 방어.
+    (UI에서 계정명을 전달했을 때 빈 피벗이 되던 문제 수정)
+    """
     df = lf.df.copy()
-    df = df[df["계정코드"].astype(str).isin([str(a) for a in accounts])]
+    accs = {str(a) for a in (accounts or [])}
+    if not accs:
+        return pd.DataFrame()
+    code_mask = df["계정코드"].astype(str).isin(accs)
+    name_mask = df["계정명"].astype(str).isin(accs) if "계정명" in df.columns else False
+    df = df[code_mask | name_mask].copy()
+    if df.empty:
+        return pd.DataFrame()
     df["월"] = pd.to_datetime(df["회계일자"], errors="coerce").dt.to_period("M").astype(str)
     # 월 기준 발생액(절대값) 합계 피벗
     pivot = df.pivot_table(index="월", columns="계정명", values="거래금액_절대값", aggfunc="sum").fillna(0.0)
