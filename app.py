@@ -1177,6 +1177,9 @@ if uploaded_file is not None:
                         except Exception as _e:
                             st.warning(f"그림 입력 점검 실패: {_e}")
 
+                    # === 옵션: 경계선 표시 토글 ===
+                    show_dividers = st.checkbox("연/분기 경계선 표시", value=True, key="ts_show_dividers")
+
                     # === 그래프 렌더(아래): 계정별로 표시 ===
                     for acc_name, df_all in results_per_account.items():
                         for measure in (["flow","balance"] if (df_all["measure"].eq("balance").any()) else ["flow"]):
@@ -1184,8 +1187,11 @@ if uploaded_file is not None:
                             dfm["date"] = pd.to_datetime(dfm["date"], errors="coerce")
                             dfm = dfm.sort_values("date").reset_index(drop=True)
                             title = f"{acc_name} — {'발생액(Flow)' if measure=='flow' else '잔액(Balance)'}"
-                            fig, stats = create_timeseries_figure(dfm, measure=measure, title=title,
-                                                                  pm_value=PM, show_dividers=False)
+                            fig, stats = create_timeseries_figure(
+                                dfm, measure=measure, title=title,
+                                pm_value=PM,
+                                show_dividers=bool(show_dividers)
+                            )
                             st.subheader(title)
                             if fig is not None:
                                 st.plotly_chart(fig, use_container_width=True)

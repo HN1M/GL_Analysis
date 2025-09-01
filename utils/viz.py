@@ -219,44 +219,37 @@ def add_time_dividers(fig, xdates, show_quarter: bool = True, show_year_label: b
 def add_period_guides(fig, x_series):
     """
     월 단위 시계열에 연/분기 경계선 추가.
-    - 연: 1월 시작점(굵기 2.5, dash, gray)
-    - 분기: 3,6,9,12월(얇은 dot, lightgray)
-    도형은 paper 전체 높이(yref='paper')로 그립니다.
+    - 연말(12월): 굵은 점선(검정)
+    - 분기말(3/6/9/12월): 얇은 점선(회색)
     """
+    import pandas as _pd
     try:
-        if isinstance(x_series, pd.Series):
-            xs = pd.to_datetime(x_series)
-        else:
-            xs = pd.to_datetime(pd.Index(x_series))
-        months = pd.DatetimeIndex(xs.sort_values().unique())
+        xs = _pd.to_datetime(x_series)
     except Exception:
-        return fig
-    if months.empty:
-        return fig
-
-    # 연 시작(YYYY-01)
-    year_starts = [m for m in months if m.month == 1]
-    for d in year_starts:
         try:
-            fig.add_shape(
-                type="line", x0=d, x1=d, y0=0, y1=1,
-                xref="x", yref="paper",
-                line=dict(width=2.5, dash="dash", color="gray"),
-                layer="below"
-            )
+            xs = _pd.to_datetime(_pd.Index(x_series))
+        except Exception:
+            return fig
+    if xs is None or len(xs) == 0:
+        return fig
+    x_min, x_max = xs.min(), xs.max()
+    if _pd.isna(x_min) or _pd.isna(x_max):
+        return fig
+    months = _pd.date_range(x_min, x_max, freq="M")
+
+    # 연말: 12월(굵은 선)
+    year_ends = [m for m in months if m.month == 12]
+    for x in year_ends:
+        try:
+            fig.add_vline(x=x, line=dict(width=2, dash="dash"), line_color="black")
         except Exception:
             continue
 
-    # 분기(3,6,9,12)
-    q_marks = [m for m in months if m.month in (3, 6, 9, 12)]
-    for d in q_marks:
+    # 분기말: 3/6/9/12월(얇은 점선)
+    quarter_ends = [m for m in months if m.month in (3, 6, 9, 12)]
+    for x in quarter_ends:
         try:
-            fig.add_shape(
-                type="line", x0=d, x1=d, y0=0, y1=1,
-                xref="x", yref="paper",
-                line=dict(width=1, dash="dot", color="lightgray"),
-                layer="below"
-            )
+            fig.add_vline(x=x, line=dict(width=1, dash="dot"), line_color="gray")
         except Exception:
             continue
     return fig
