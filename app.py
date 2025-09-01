@@ -124,7 +124,13 @@ def _apply_cycles_to_picker(*, upload_id: str, cycles_state_key: str, accounts_s
 
 
 # --- NEW: Correlation UI helpers (DRY) ---
-from analysis.correlation import run_correlation_module  # 표준(기본) 상관 모듈
+from analysis.correlation import (
+    run_correlation_module,
+    run_correlation_focus_module as run_corr_focus,
+    friendly_correlation_explainer,
+    suggest_anchor_accounts,
+)
+from config import CORR_THRESHOLD_DEFAULT, CORR_MIN_ACTIVE_MONTHS_DEFAULT
 
 def _render_corr_basic_tab(*, upload_id: str):
     """
@@ -136,27 +142,39 @@ def _render_corr_basic_tab(*, upload_id: str):
     mdf = st.session_state.master_df
     acct_names = sorted(mdf['계정명'].dropna().astype(str).unique().tolist())
     st.subheader("계정 간 상관 히트맵(기본)")
-    colA, colB = st.columns([2,1])
-    with colA:
-        picked_accounts = st.multiselect(
-            "상관 분석 대상 계정(2개 이상 선택)",
-            acct_names,
-            default=[],
-            help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다.",
-            key="corr_basic_accounts"
+    # 버퍼 적용(위젯 생성 전)
+    if st.session_state.get("corr_basic_accounts_needs_update") and st.session_state.get("corr_basic_accounts_buf"):
+        st.session_state["corr_basic_accounts"] = list(st.session_state["corr_basic_accounts_buf"])  
+        st.session_state["corr_basic_accounts_needs_update"] = False
+
+    # 대상 계정 선택 위젯
+    picked_accounts = st.multiselect(
+        "상관 분석 대상 계정(2개 이상 선택)",
+        acct_names,
+        default=[],
+        help="선택한 계정들 간 월별 흐름의 피어슨 상관을 계산합니다.",
+        key="corr_basic_accounts"
+    )
+
+    # 사이클 프리셋(대상 계정 선택 하단)
+    cycles_map_now = cyc.get_effective_cycles(upload_id)
+    if cycles_map_now:
+        picked_cycles = st.multiselect(
+            "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
+            default=[], key="corr_basic_cycles"
         )
-    with colB:
-        cycles_map_now = cyc.get_effective_cycles(upload_id)
-        if cycles_map_now:
-            picked_cycles = st.multiselect(
-                "사이클 프리셋 선택", list(cyc.CYCLE_KO.values()),
-                default=[], key="corr_basic_cycles"
+        if st.button("➕ 프리셋 적용", key="btn_apply_cycles_corr_basic"):
+            mapping = cyc.get_effective_cycles(upload_id)
+            codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles)
+            code_to_name = (
+                mdf[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
+                  .set_index('계정코드')['계정명'].astype(str).to_dict()
             )
-            st.button("➕ 프리셋 적용", key="btn_apply_cycles_corr_basic", on_click=_apply_cycles_to_picker,
-                      kwargs=dict(upload_id=upload_id,
-                                  cycles_state_key="corr_basic_cycles",
-                                  accounts_state_key="corr_basic_accounts",
-                                  master_df=st.session_state.master_df))
+            cur_set = set(st.session_state.get("corr_basic_accounts", []))
+            cur_set.update({code_to_name.get(c, c) for c in codes})
+            st.session_state["corr_basic_accounts_buf"] = sorted(cur_set)
+            st.session_state["corr_basic_accounts_needs_update"] = True
+            st.rerun()
     corr_thr = st.slider(
         "상관 임계치(강한 상관쌍 표 전용)",
         min_value=0.50, max_value=0.95, step=0.05, value=0.70,
@@ -241,21 +259,28 @@ def _render_corr_advanced_tab(*, upload_id: str):
 
     mdf_adv = st.session_state.master_df
     acct_names_adv = sorted(mdf_adv['계정명'].dropna().astype(str).unique().tolist())
-    colA, colB = st.columns(2)
-    with colA:
-        picked_accounts_adv = st.multiselect("분석 계정(다중 선택)", options=acct_names_adv, key="corr_adv_accounts")
-    with colB:
-        picked_cycles_adv = st.multiselect("사이클 프리셋(선택 시 계정 자동 반영)", options=list(cyc.CYCLE_KO.values()), key="corr_adv_cycles")
-        if st.button("프리셋 적용", key="btn_apply_preset_corr_adv"):
-            mapping = cyc.get_effective_cycles(upload_id)
-            codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles_adv)
-            code_to_name = (
-                mdf_adv[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
-                    .set_index('계정코드')['계정명'].astype(str).to_dict()
-            )
-            cur_set = set(st.session_state.get("corr_adv_accounts", []))
-            cur_set.update({code_to_name.get(c, c) for c in codes})
-            st.session_state["corr_adv_accounts"] = sorted(cur_set)
+    # 버퍼 적용(위젯 생성 전)
+    if st.session_state.get("corr_adv_accounts_needs_update") and st.session_state.get("corr_adv_accounts_buf"):
+        st.session_state["corr_adv_accounts"] = list(st.session_state["corr_adv_accounts_buf"])  
+        st.session_state["corr_adv_accounts_needs_update"] = False
+
+    # 대상 계정 선택
+    picked_accounts_adv = st.multiselect("분석 계정(다중 선택)", options=acct_names_adv, key="corr_adv_accounts")
+    
+    # 사이클 프리셋(대상 계정 선택 하단)
+    picked_cycles_adv = st.multiselect("사이클 프리셋(선택 시 계정 자동 반영)", options=list(cyc.CYCLE_KO.values()), key="corr_adv_cycles")
+    if st.button("프리셋 적용", key="btn_apply_preset_corr_adv"):
+        mapping = cyc.get_effective_cycles(upload_id)
+        codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles_adv)
+        code_to_name = (
+            mdf_adv[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
+                .set_index('계정코드')['계정명'].astype(str).to_dict()
+        )
+        cur_set = set(st.session_state.get("corr_adv_accounts", []))
+        cur_set.update({code_to_name.get(c, c) for c in codes})
+        st.session_state["corr_adv_accounts_buf"] = sorted(cur_set)
+        st.session_state["corr_adv_accounts_needs_update"] = True
+        st.rerun()
 
     method = st.selectbox("상관 방식", ["pearson", "spearman", "kendall"], index=0, key="corr_adv_method")
     corr_threshold = st.slider("임계치(|r|)", 0.1, 0.95, 0.70, 0.05, key="corr_adv_thr")
@@ -296,6 +321,31 @@ def _render_corr_advanced_tab(*, upload_id: str):
                 st.dataframe(mr.tables["rolling_stability"], use_container_width=True)
         except Exception as _e:
             st.warning(f"고급 상관 분석 실패: {_e}")
+
+# --- NEW: Focus Tab (단일계정) ---
+def _render_corr_focus_tab(*, upload_id: str):
+    import services.cycles_store as cyc
+    from analysis.correlation import run_correlation_focus_module
+    st.subheader("단일 계정(포커스) 상관")
+    lf_use = _lf_by_scope()
+    if lf_use is None or lf_use.df.empty:
+        st.info("분석할 데이터가 없습니다."); return
+    mdf = st.session_state.master_df
+    acct_names = sorted(mdf['계정명'].dropna().astype(str).unique().tolist())
+    col1, col2 = st.columns([2,1])
+    with col1:
+        focus_name = st.selectbox("포커스 계정(1개)", options=["선택하세요..."]+acct_names, index=0, key="corr_focus_name")
+    with col2:
+        within = st.checkbox("동일 사이클 내에서만", value=True, help="선택 시 같은 사이클에 속한 계정들만 비교합니다.", key="corr_focus_within")
+    if focus_name and focus_name != "선택하세요...":
+        code = (mdf[mdf['계정명']==focus_name]['계정코드'].astype(str).head(1).tolist() or [""])[0]
+        mapping = cyc.get_effective_cycles(upload_id)
+        mr = run_correlation_focus_module(lf_use, focus_account=focus_name, cycles_map=mapping, within_same_cycle=bool(within))
+        _push_module(mr)
+        for w in mr.warnings: st.warning(w)
+        if "bar" in mr.figures: st.plotly_chart(mr.figures["bar"], use_container_width=True)
+        if "focus_corr" in mr.tables and not mr.tables["focus_corr"].empty:
+            st.dataframe(mr.tables["focus_corr"], use_container_width=True, height=_auto_table_height(mr.tables["focus_corr"]))
 
 
 # --- 3. UI 부분 ---
@@ -880,7 +930,7 @@ if uploaded_file is not None:
                     master_df: pd.DataFrame = st.session_state.get("master_df", pd.DataFrame())
                     if master_df.empty:
                         st.info("원장 데이터가 없습니다.")
-                        st.stop()
+                        # st.stop() 제거하여 뒤 탭 렌더 차단 방지
 
                     # --- state bootstrap --- (위젯 생성 전에 실행)
                     st.session_state.setdefault("ts_accounts_names", [])
@@ -1532,50 +1582,14 @@ if uploaded_file is not None:
                 
                 with tab_corr:
                     st.header("상관관계")
-                    
-                    # === 앱 초기화 시 빈 화면 방지 ===
                     if not uploaded_file:
                         st.info("📁 원장 파일을 업로드하면 상관관계 분석이 가능합니다.")
                     else:
                         upload_id = getattr(uploaded_file, 'name', '_default')
-                        # 한 탭 내 순차 렌더(서브탭 사용 금지)
-                        def _render_corr_basic_tab(upload_id):
-                            """기본 상관관계 렌더링"""
-                            try:
-                                from analysis.correlation import run_correlation_module
-                                lf_use = _lf_by_scope()
-                                if lf_use is None or lf_use.df.empty:
-                                    st.info("분석할 데이터가 없습니다.")
-                                    return
-                                
-                                # 상관관계 분석 실행
-                                mr = run_correlation_module(lf_use)
-                                
-                                # 결과 표시
-                                if "correlation_matrix" in mr.figures:
-                                    st.plotly_chart(mr.figures["correlation_matrix"], use_container_width=True)
-                                
-                                if "high_corr_pairs" in mr.tables:
-                                    st.subheader("높은 상관관계 계정 쌍")
-                                    st.dataframe(mr.tables["high_corr_pairs"], use_container_width=True)
-                                    
-                                if mr.warnings:
-                                    for warning in mr.warnings:
-                                        st.warning(warning)
-                                        
-                            except Exception as e:
-                                st.error(f"기본 상관분석 오류: {e}")
-                        
-                        def _render_corr_advanced_tab(upload_id):
-                            """고급 상관관계 렌더링 (현재 구현 중)"""
-                            st.info("🚧 고급 상관분석 기능은 현재 개발 중입니다.")
-                            st.caption("시계열 분석 후 기본 상관관계를 확인해 주세요.")
-                        
-                        st.subheader("기본 상관관계")
-                        _render_corr_basic_tab(upload_id=upload_id)
-                        st.markdown("---")
-                        st.subheader("고급 상관관계")
-                        _render_corr_advanced_tab(upload_id=upload_id)
+                        tb1, tb2, tb3 = st.tabs(["기본", "고급", "포커스(1계정)"])
+                        with tb1: _render_corr_basic_tab(upload_id=upload_id)
+                        with tb2: _render_corr_advanced_tab(upload_id=upload_id)
+                        with tb3: _render_corr_focus_tab(upload_id=upload_id)
                 with tab_report:
                     st.header("🧠 분석 종합 대시보드")
                     
@@ -1943,9 +1957,12 @@ if uploaded_file is not None:
                                 # 상관(2개 이상일 때만)
                                 try:
                                     if len(pick_codes) >= 2:
-                                        _push_module(run_correlation_module(lf_use, accounts=pick_codes,
-                                                                            corr_threshold=0.70,
-                                                                            cycles_map=cyc.get_effective_cycles()))
+                                        _push_module(run_correlation_module(
+                                            lf_use, accounts=pick_codes,
+                                            corr_threshold=float(CORR_THRESHOLD_DEFAULT),
+                                            cycles_map=cyc.get_effective_cycles(upload_id),
+                                            emit_evidences=True,
+                                        ))
                                 except Exception as _e:
                                     st.warning(f"correlation 모듈 실패: {_e}")
                                 # 정합성(ModuleResult) — 선택 계정 필터 적용

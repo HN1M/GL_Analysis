@@ -11,6 +11,19 @@ SHAP_TOP_N_PER_ACCOUNT_DEFAULT = 25   # 사용자 UI에서 20~30 범위 선택 �
 CYCLE_RECOMMENDER = "llm_only"        # LLM 100% 자동 추천
 PM_DEFAULT = PM_DEFAULT              # (kept above; single source of truth)
 
+# --- Correlation defaults ---
+# New canonical names
+CORR_DEFAULT_METHOD = "pearson"
+CORR_THRESHOLD_DEFAULT = 0.70
+CORR_MIN_ACTIVE_MONTHS_DEFAULT = 6
+CORR_MAX_LAG_DEFAULT = 6
+CORR_ROLLING_WINDOW_DEFAULT = 6
+
+# Backward-compatible aliases (kept for existing imports)
+CORR_METHOD_DEFAULT = CORR_DEFAULT_METHOD
+CORR_MIN_ACTIVE_MONTHS = CORR_MIN_ACTIVE_MONTHS_DEFAULT
+CORR_ROLLWIN_DEFAULT = CORR_ROLLING_WINDOW_DEFAULT
+
 # ---- NEW: Embedding & Clustering defaults ----
 # Embedding model switch (Small by default; Large improves semantics at higher cost)
 EMB_MODEL_SMALL = "text-embedding-3-small"
@@ -55,6 +68,18 @@ STANDARD_ACCOUNTING_CYCLES = {
     "FixedAssets": ["유형자산", "감가상각누계", "기계장치", "건물", "비품", "PPE", "Fixed Asset"],
     "Equity": ["자본금", "이익잉여금", "자본잉여금", "Equity", "Capital"],
 }
+
+# --- NEW: Anomaly (Semantic & Isolation Forest) defaults ---
+IFOREST_ENABLED_DEFAULT = True
+IFOREST_N_ESTIMATORS = 256
+IFOREST_MAX_SAMPLES = "auto"
+IFOREST_CONTAM_DEFAULT = 0.03
+IFOREST_RANDOM_STATE = 42
+
+# Semantic outlier thresholds
+SEMANTIC_Z_THRESHOLD = 2.5
+SEMANTIC_MIN_RECORDS = 12
+ANOMALY_IFOREST_SCORE_THRESHOLD = 0.70
 
 # --- Provisional rule naming (도메인 합의 전) ---
 PROVISIONAL_RULE_VERSION = "v1.0"

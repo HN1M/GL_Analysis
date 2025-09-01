@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict
 from analysis.contracts import ModuleResult, EvidenceDetail, LedgerFrame
+from config import CORR_THRESHOLD_DEFAULT, CORR_MAX_LAG_DEFAULT, CORR_ROLLWIN_DEFAULT
 import plotly.express as px
 
 
@@ -72,9 +73,11 @@ def run_corr_advanced(
     accounts: List[str],
     *,
     method: str = "pearson",
-    corr_threshold: float = 0.7,
-    max_lag: int = 6,
-    rolling_window: int = 6,
+    corr_threshold: float = CORR_THRESHOLD_DEFAULT,
+    max_lag: int = CORR_MAX_LAG_DEFAULT,
+    rolling_window: int = CORR_ROLLWIN_DEFAULT,
+    cycles_map=None,
+    within_same_cycle: bool=False,
 ) -> ModuleResult:
     name = "corr_advanced"
     if lf is None or getattr(lf, "df", None) is None:
@@ -107,6 +110,16 @@ def run_corr_advanced(
             v = float(corr.iloc[i, j])
             if abs(v) >= float(corr_threshold):
                 strong.append({"계정A": cols[i], "계정B": cols[j], "상관계수": v})
+    # 동일 사이클 필터(선택)
+    if within_same_cycle and cycles_map and "계정명" in lf.df.columns:
+        # 이름->코드 역매핑
+        nm2cd = (lf.df.drop_duplicates("계정명")
+                    .assign(계정코드=lambda d: d["계정코드"].astype(str))
+                    .set_index("계정명")["계정코드"].astype(str).to_dict())
+        def _same(a,b):
+            ca, cb = nm2cd.get(a), nm2cd.get(b)
+            return (cycles_map.get(str(ca)) == cycles_map.get(str(cb))) if (ca and cb and isinstance(cycles_map, dict)) else True
+        strong = [r for r in strong if _same(r["계정A"], r["계정B"])]
     strong_df = pd.DataFrame(strong)
 
     # 최적 시차 상관
@@ -115,17 +128,22 @@ def run_corr_advanced(
     # 롤링 안정성(낮은 변동성 우선)
     roll = pd.DataFrame(_rolling_stability(pivot, int(rolling_window)))
 
-    # Evidence 샘플
+    # Evidence 샘플(상위 10개): |r|을 anomaly_score로 활용
     evid: List[EvidenceDetail] = []
+    # 각 계정의 월별 절대발생액 합(규모) → 증거의 재무영향 추정치로 사용
+    size_by_acct = pivot.abs().sum(axis=0).astype(float).to_dict()
     for row in strong[: min(10, len(strong))]:
+        a, b = str(row["계정A"]), str(row["계정B"])
+        r = float(row["상관계수"])
         evid.append(EvidenceDetail(
-            row_id=f"{row['계정A']}|{row['계정B']}",
-            reason=f"corr={row['상관계수']:+.2f} (|r|≥{corr_threshold})",
-            risk_score=min(1.0, abs(float(row["상관계수"]))),
-            financial_impact=0.0,
+            row_id=f"{a}|{b}",
+            reason=f"corr={r:+.2f} (|r|≥{corr_threshold})",
+            anomaly_score=abs(r),
+            financial_impact=float(min(size_by_acct.get(a, 0.0), size_by_acct.get(b, 0.0))),
+            risk_score=abs(r),
             is_key_item=False,
             impacted_assertions=[],
-            links={"account_a": row["계정A"], "account_b": row["계정B"], "type": "corr_strong"},
+            links={"account_a": a, "account_b": b, "type": "corr_strong"},
         ))
 
     summary = {

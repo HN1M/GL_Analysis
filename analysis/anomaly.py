@@ -1,8 +1,14 @@
 from __future__ import annotations
-import numpy as np
+import numpy as np, math
 import pandas as pd
-from typing import List, Optional
+from typing import List, Optional, Dict, Any, Tuple
 from utils.helpers import find_column_by_keyword
+from analysis.embedding import ensure_rich_embedding_text, perform_embedding_only  # ← services 주입식 임베딩 사용
+from config import (
+    IFOREST_ENABLED_DEFAULT, IFOREST_N_ESTIMATORS, IFOREST_MAX_SAMPLES,
+    IFOREST_CONTAM_DEFAULT, IFOREST_RANDOM_STATE,
+    SEMANTIC_Z_THRESHOLD, SEMANTIC_MIN_RECORDS, ANOMALY_IFOREST_SCORE_THRESHOLD
+)
 
 
 def compute_amount_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -43,6 +49,100 @@ def calculate_grouped_stats_and_zscore(df: pd.DataFrame, target_accounts: List[s
         med = float(tgt.median()); mad = float((np.abs(tgt - med)).median())
         df.loc[is_target, 'Z-Score'] = 0.0 if mad == 0 else 0.6745 * (df.loc[is_target, '발생액'] - med) / mad
     return df
+
+# ---------------------- NEW: Semantic features -------------------------
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    da = float(np.linalg.norm(a)); db = float(np.linalg.norm(b))
+    if da == 0.0 or db == 0.0: return 0.0
+    return float(np.dot(a, b) / (da * db))
+
+def _zseries(x: pd.Series) -> pd.Series:
+    x = x.astype(float)
+    mu, sd = float(x.mean()), float(x.std(ddof=1))
+    if sd and sd > 0: return (x - mu) / sd
+    # MAD fallback
+    med = float(x.median()); mad = float((x.sub(med).abs()).median())
+    return pd.Series(0.0, index=x.index) if mad == 0 else 0.6745 * (x - med) / mad
+
+def _maybe_subcluster_vectors(X: np.ndarray) -> np.ndarray:
+    """Return labels for vectors (auto-k KMeans via KDMeans shim)."""
+    try:
+        from analysis.kdmeans_shim import HDBSCAN
+        model = HDBSCAN(n_clusters=None, random_state=42)
+        return model.fit_predict(X).astype(int)
+    except Exception:
+        return np.zeros(len(X), dtype=int)
+
+def _add_semantic_features(
+    df: pd.DataFrame,
+    *,
+    acct_col: str,
+    embed_client: Any,
+    embed_texts_fn,              # injected (e.g., services.cache.get_or_embed_texts)
+    use_large: Optional[bool] = None,
+    subcluster: bool = False
+) -> pd.DataFrame:
+    """임베딩 벡터, 계정/클러스터 센트로이드, semantic_z(코사인 거리 z) 생성."""
+    if df is None or df.empty: return df
+    base = ensure_rich_embedding_text(df.copy())  # desc+vendor+월+규모+성격 조합 텍스트 생성
+    base = perform_embedding_only(
+        base, client=embed_client, text_col="embedding_text",
+        use_large=use_large, embed_texts_fn=embed_texts_fn
+    )
+    if 'vector' not in base.columns or base['vector'].isna().any():
+        return base
+    # 벡터 행렬
+    V = np.vstack(base['vector'].values).astype(float)
+    # 선택: 계정 내 서브클러스터
+    if subcluster:
+        labels = pd.Series(index=base.index, dtype=int)
+        for code, sub in base.groupby(base[acct_col].astype(str)):
+            idx = sub.index
+            Xi = np.vstack(sub['vector'].values)
+            if len(Xi) < max(SEMANTIC_MIN_RECORDS, 4):
+                labels.loc[idx] = 0
+            else:
+                labels.loc[idx] = _maybe_subcluster_vectors(Xi)
+        base['cluster_id'] = labels.astype(int)
+    else:
+        base['cluster_id'] = 0
+    # 그룹(계정×클러스터) 센트로이드 & 코사인 거리
+    dists = []
+    for (acct, cid), sub in base.groupby([base[acct_col].astype(str), 'cluster_id']):
+        vecs = np.vstack(sub['vector'].values)
+        c = vecs.mean(axis=0)
+        # 1 - cosine sim → semantic distance
+        dd = [1.0 - _cosine(v, c) for v in vecs]
+        dists.append(pd.Series(dd, index=sub.index))
+    base['semantic_dist'] = pd.concat(dists).sort_index()
+    # z-표준화(계정×클러스터별)
+    base['semantic_z'] = (
+        base.groupby([base[acct_col].astype(str), 'cluster_id'])['semantic_dist']
+            .transform(_zseries)
+            .astype(float)
+    )
+    return base
+
+# ---------------------- NEW: Isolation Forest --------------------------
+def _fit_iforest_and_score(F: pd.DataFrame, *, contamination: float) -> np.ndarray:
+    """Return anomaly scores in [0,1]."""
+    try:
+        from sklearn.ensemble import IsolationForest
+    except Exception:
+        return np.zeros(len(F), dtype=float)
+    # NaN 방어 및 스케일링 간단 적용
+    X = F.fillna(0.0).astype(float).values
+    iso = IsolationForest(
+        n_estimators=int(IFOREST_N_ESTIMATORS),
+        max_samples=IFOREST_MAX_SAMPLES,
+        contamination=float(contamination),
+        random_state=int(IFOREST_RANDOM_STATE),
+        n_jobs=-1
+    ).fit(X)
+    raw = -iso.score_samples(X)              # 더 클수록 이상
+    lo, hi = float(np.min(raw)), float(np.max(raw))
+    s = (raw - lo) / (hi - lo + 1e-12)      # [0,1]
+    return s
 
 # --- NEW: ensure_zscore ---
 def ensure_zscore(df: pd.DataFrame, account_codes: List[str]):
@@ -136,7 +236,21 @@ def _assertions_for_row(z_val: float) -> List[str]:
     return sorted(out)
 
 
-def run_anomaly_module(lf, target_accounts=None, topn=20, pm_value: Optional[float] = None):
+def run_anomaly_module(
+    lf,
+    target_accounts=None,
+    topn=20,
+    pm_value: Optional[float] = None,
+    *,
+    # --- NEW: injection knobs (analysis 레이어는 services에 직접 의존 금지) ---
+    embed_client: Any = None,
+    embed_texts_fn=None,
+    use_large_embedding: Optional[bool] = None,
+    semantic_enabled: bool = True,
+    subcluster_enabled: bool = False,
+    iforest_enabled: Optional[bool] = None,
+    iforest_contamination: Optional[float] = None,
+):
     df = lf.df.copy()
     acct_col = find_column_by_keyword(df.columns, '계정코드')
     if not acct_col:
@@ -155,8 +269,42 @@ def run_anomaly_module(lf, target_accounts=None, topn=20, pm_value: Optional[flo
     # 이상치 플래그 (±3σ)
     df['is_outlier'] = df['Z-Score'].abs() >= 3
 
+    # === (NEW) 의미피처/IForest 생성 ===
+    if semantic_enabled and (embed_client is not None) and (embed_texts_fn is not None):
+        try:
+            df = _add_semantic_features(
+                df, acct_col=acct_col, embed_client=embed_client,
+                embed_texts_fn=embed_texts_fn, use_large=use_large_embedding,
+                subcluster=subcluster_enabled
+            )
+        except Exception:
+            # 의미피처 실패해도 기본 Z-Score 흐름은 유지
+            pass
+    # Isolation Forest (의미피처가 있든 없든 수치특징만으로도 동작)
+    if iforest_enabled is None:
+        iforest_enabled = bool(IFOREST_ENABLED_DEFAULT)
+    if iforest_enabled:
+        try:
+            feats: Dict[str, Any] = {}
+            feats['amt']      = pd.to_numeric(df.get('발생액', 0.0), errors='coerce').abs()
+            feats['amt_log']  = np.log1p(feats['amt'])
+            feats['z_abs']    = df.get('Z-Score', 0.0).abs()
+            feats['sem_abs']  = df.get('semantic_z', 0.0).abs() if 'semantic_z' in df.columns else 0.0
+            if '연월' in df.columns:
+                # 간단 월 인덱스(모델의 시퀀스 surrogate)
+                feats['month_idx'] = pd.Categorical(df['연월']).codes.astype(float)
+            F = pd.DataFrame(feats, index=df.index)
+            contam = float(iforest_contamination) if iforest_contamination is not None else float(IFOREST_CONTAM_DEFAULT)
+            df['iforest_score'] = _fit_iforest_and_score(F, contamination=contam)
+        except Exception:
+            pass
+
     # 이상치 후보 테이블 (절댓값 기준 상위)
     out_cols = [c for c in ['row_id','회계일자','연월','계정코드','계정명','거래처','적요','발생액','Z-Score'] if c in df.columns]
+    # (NEW) 테이블에 신호 컬럼 노출
+    for extra in ['semantic_z','iforest_score','cluster_id']:
+        if extra in df.columns and extra not in out_cols:
+            out_cols.append(extra)
     cand = (df.assign(absz=df['Z-Score'].abs())
               .sort_values('absz', ascending=False)
               .drop(columns=['absz'])
@@ -167,19 +315,36 @@ def run_anomaly_module(lf, target_accounts=None, topn=20, pm_value: Optional[flo
     pm = float(pm_value) if pm_value is not None else float(PM_DEFAULT)
     ev_rows: List[EvidenceDetail] = []
     # 증거 채집 대상: (1) PM 초과 or (2) |Z|>=2.5 or (3) 상위 topn
+    #               + (4) semantic_z 과대 or (5) iforest_score 과대
     mask_key = df['발생액'].abs() >= pm if '발생액' in df.columns else pd.Series(False, index=df.index)
     mask_z   = df['Z-Score'].abs() >= 2.5 if 'Z-Score' in df.columns else pd.Series(False, index=df.index)
-    idx_sel  = set(df.index[mask_key | mask_z].tolist()) | set(table.index.tolist())
+    mask_sem = df['semantic_z'].abs() >= float(SEMANTIC_Z_THRESHOLD) if 'semantic_z' in df.columns else pd.Series(False, index=df.index)
+    thr_ifo  = float(ANOMALY_IFOREST_SCORE_THRESHOLD)
+    mask_ifo = df['iforest_score'] >= thr_ifo if 'iforest_score' in df.columns else pd.Series(False, index=df.index)
+    idx_sel  = set(df.index[mask_key | mask_z | mask_sem | mask_ifo].tolist()) | set(table.index.tolist())
     sub = df.loc[sorted(idx_sel)].copy() if len(idx_sel)>0 else df.head(0).copy()
     for _, r in sub.iterrows():
         z  = float(r.get('Z-Score', 0.0)) if pd.notna(r.get('Z-Score', np.nan)) else 0.0
         za = abs(z)
         amt = float(r.get('발생액', 0.0))
-        a, f, k, score = _risk_from(za, amt, pm)
+        a, f, k, score = _risk_from(za, amt, pm)   # (기존) 통합 위험 점수는 PM/|Z| 기반 유지
+        # (NEW) anomaly_score에 의미/IForest 신호를 반영해 탐색 우선순위 개선
+        semz = float(abs(r.get('semantic_z', 0.0))) if pd.notna(r.get('semantic_z', np.nan)) else 0.0
+        ifo  = float(r.get('iforest_score', 0.0)) if pd.notna(r.get('iforest_score', np.nan)) else 0.0
+        try:
+            div = float(Z_SIGMOID_DIVISOR) if float(Z_SIGMOID_DIVISOR) > 0 else 3.0
+        except Exception:
+            div = 3.0
+        sem_a = 1.0 / (1.0 + math.exp(-(semz/div))) if semz > 0 else 0.0
+        anomaly_score = float(max(a, sem_a, ifo))
         ev_rows.append(EvidenceDetail(
             row_id=str(r.get('row_id','')),
-            reason=f"amt_z={z:+.2f}",
-            anomaly_score=float(a),
+            reason="; ".join(filter(None, [
+                f"amt_z={z:+.2f}",
+                (f"sem_z={r.get('semantic_z'):+.2f}" if 'semantic_z' in r and pd.notna(r['semantic_z']) else ""),
+                (f"iforest={ifo:.2f}" if 'iforest_score' in r and pd.notna(r['iforest_score']) else "")
+            ])),
+            anomaly_score=anomaly_score,
             financial_impact=abs(amt),
             risk_score=float(score),
             is_key_item=bool(abs(amt) >= pm),
