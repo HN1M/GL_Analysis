@@ -1,23 +1,17 @@
 # services/cycles_store.py
 from __future__ import annotations
 from typing import Dict, Iterable, List
+import os, json
 
-# 내부 표준 코드(영문) — 저장/로직용
-ALLOWED_CYCLES = [
-    "CLOSE",            # 결산/조정
-    "REV",              # 매출
-    "PUR",              # 매입/구매/비용
-    "HR",               # 인사(급여/복리후생/퇴직)
-    "TREASURY_INVEST",  # 자금운용(예금/금융상품/투자/파생자산/이자·배당수익)
-    "TREASURY_FINANCE", # 자금조달(차입금/사채/이자비용)
-    "TAX",              # 세무(부가세/법인세/원천 등)
-    "PPE",              # 유형자산
-    "INTANG",           # 무형자산
-    "LEASE",            # 리스(사용권자산/리스부채/리스료)
-    "OTHER",            # 기타
+# -------------------------------------------------
+# 0) 사이클 코드/라벨
+# -------------------------------------------------
+ALLOWED_CYCLES: List[str] = [
+    "CLOSE", "REV", "PUR", "HR",
+    "TREASURY_INVEST", "TREASURY_FINANCE",
+    "TAX", "PPE", "INTANG", "LEASE", "OTHER",
 ]
 
-# 화면용 한글 라벨 매핑
 CYCLE_KO: Dict[str, str] = {
     "CLOSE":            "결산",
     "REV":              "매출",
@@ -39,8 +33,10 @@ def code_to_ko(code: str) -> str:
 def ko_to_code(label: str) -> str:
     return KO_TO_CODE.get(str(label), "OTHER")
 
-# 업로드 단위 저장소(메모리). 필요하면 파일/DB 저장으로 교체 가능.
-_MEM: Dict[str, Dict[str, str]] = {}   # {upload_id: {account_code: cycle_name}}
+# -------------------------------------------------
+# 1) 업로드별 계정→사이클 ‘매핑’ 저장/조회 (세션 메모리)
+# -------------------------------------------------
+_MEM: Dict[str, Dict[str, str]] = {}   # {upload_id: {account_code: cycle_code}}
 
 def set_cycles_map(upload_id: str, mapping: Dict[str, str]) -> None:
     """업로드 식별자 별 계정→사이클 매핑 저장."""
@@ -59,24 +55,67 @@ def get_cycles_map(upload_id: str) -> Dict[str, str]:
     return dict(_MEM.get(upload_id, {}))
 
 def get_effective_cycles(upload_id: str | None = None) -> Dict[str, str]:
-    """UI 편의용: 업로드 id 없으면 빈 dict 반환(기본값)."""
+    """
+    UI 편의용: 현재 업로드의 '계정→사이클 매핑'만 반환.
+    (⚠️ 프리셋과 다름. 인자 필요)
+    """
     if upload_id and upload_id in _MEM:
         return dict(_MEM[upload_id])
     return {}
 
+def accounts_for_cycles(mapping: Dict[str, str], cycles: Iterable[str]) -> List[str]:
+    want = set(map(str, (cycles or [])))
+    return [code for code, cyc in (mapping or {}).items() if str(cyc) in want]
+
+def accounts_for_cycles_ko(mapping: Dict[str, str], cycles_ko: Iterable[str]) -> List[str]:
+    codes = [ko_to_code(x) for x in (cycles_ko or [])]
+    return accounts_for_cycles(mapping, codes)
+
+# -------------------------------------------------
+# 2) ‘프리셋’(사이클 카테고리 정의) — 표준 + 사용자 오버라이드
+# -------------------------------------------------
+try:
+    from config import STANDARD_ACCOUNTING_CYCLES, CYCLES_USER_OVERRIDES_PATH
+except Exception:
+    STANDARD_ACCOUNTING_CYCLES, CYCLES_USER_OVERRIDES_PATH = {}, ""
+
+def _load_overrides() -> Dict[str, List[str]]:
+    p = CYCLES_USER_OVERRIDES_PATH
+    if not p or not os.path.exists(p):
+        return {}
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {str(k): [str(x) for x in v] for k, v in data.items() if isinstance(v, list)}
+    except Exception:
+        return {}
+
+def get_cycles_preset() -> Dict[str, List[str]]:
+    """
+    '사이클 코드 → [키워드/샘플계정 등]' 프리셋 정의 반환.
+    (⚠️ 매핑 아님. 인자 없음)
+    """
+    base = {str(k): list(v) for k, v in (STANDARD_ACCOUNTING_CYCLES or {}).items()}
+    ov = _load_overrides()
+    for k, v in ov.items():
+        base[str(k)] = list(v)
+    return base
+
+# -------------------------------------------------
+# 3) 룰 기반 초안 + (선택) LLM 보정 → 매핑 빌드
+# -------------------------------------------------
 def rule_based_guess(code_to_name: Dict[str, str]) -> Dict[str, str]:
-    """계정명 규칙기반 사이클 추정(가벼운 기본기능)."""
     KW = {
-        "CLOSE":  ["결산", "조정", "대손", "충당금", "평가손실", "평가이익", "외화환산"],
-        "REV":    ["매출", "상품매출", "용역수익", "수익", "매출채권", "외상매출"],
-        "PUR":    ["매입", "구매", "원재료", "상품매입", "외주", "용역비", "지급수수료", "운반비", "광고선전", "접대", "임차료", "수수료", "수도광열", "통신비"],
-        "HR":     ["급여", "임금", "상여", "퇴직", "복리후생", "연금", "식대", "경조", "의료비"],
-        "TREASURY_INVEST": ["예금", "CMA", "단기금융상품", "유가증권", "투자", "파생", "이자수익", "배당수익", "금융수익"],
-        "TREASURY_FINANCE":["차입금", "대출", "사채", "어음", "이자비용", "금융비용"],
-        "TAX":    ["부가세", "법인세", "원천", "지방세", "가산세", "세금과공과"],
-        "PPE":    ["유형자산", "건설중", "기계장치", "비품", "차량", "건물", "토지", "감가상각", "처분손익"],
-        "INTANG": ["무형자산", "개발비", "소프트웨어", "상표권", "영업권", "상각비"],
-        "LEASE":  ["리스", "사용권자산", "리스부채", "리스료"],
+        "CLOSE":  ["결산","조정","대손","충당금","평가손실","평가이익","외화환산"],
+        "REV":    ["매출","용역수익","수익","외상매출","매출채권","Sales","Revenue"],
+        "PUR":    ["매입","구매","원재료","용역비","지급수수료","운반비","광고","접대","임차","수수료","수도","통신"],
+        "HR":     ["급여","임금","상여","퇴직","복리후생","연금","식대","경조","의료"],
+        "TREASURY_INVEST": ["예금","CMA","금융상품","유가증권","투자","파생","이자수익","배당"],
+        "TREASURY_FINANCE":["차입금","대출","사채","어음","이자비용","금융비용"],
+        "TAX":    ["부가세","법인세","원천","지방세","가산세","세금과공과"],
+        "PPE":    ["유형자산","건설중","기계","비품","차량","건물","토지","감가상각","처분손익"],
+        "INTANG": ["무형자산","개발비","소프트웨어","상표권","영업권","상각"],
+        "LEASE":  ["리스","사용권자산","리스부채","리스료"],
     }
     out: Dict[str, str] = {}
     for code, nm in (code_to_name or {}).items():
@@ -89,15 +128,6 @@ def rule_based_guess(code_to_name: Dict[str, str]) -> Dict[str, str]:
         out[str(code)] = label
     return out
 
-def accounts_for_cycles(mapping: Dict[str, str], cycles: Iterable[str]) -> List[str]:
-    """선택한 사이클에 해당하는 계정코드 리스트."""
-    want = set(map(str, cycles or []))
-    return [code for code, cyc in (mapping or {}).items() if str(cyc) in want]
-
-def accounts_for_cycles_ko(mapping: Dict[str, str], cycles_ko: Iterable[str]) -> List[str]:
-    codes = [ko_to_code(x) for x in (cycles_ko or [])]
-    return accounts_for_cycles(mapping, codes)
-
 def merge_cycles(base: Dict[str, str], override: Dict[str, str]) -> Dict[str, str]:
     out = dict(base)
     for k, v in (override or {}).items():
@@ -106,7 +136,9 @@ def merge_cycles(base: Dict[str, str], override: Dict[str, str]) -> Dict[str, st
     return out
 
 def build_cycles_preset(upload_id: str, code_to_name: Dict[str, str], use_llm: bool = False) -> Dict[str, str]:
-    """룰베이스 1차 → (선택) LLM 보조로 병합 → 저장."""
+    """
+    계정→사이클 매핑 초안 생성 후 저장. (룰베이스 + 선택적 LLM 보정)
+    """
     base = rule_based_guess(code_to_name)
     if use_llm:
         try:
@@ -119,16 +151,8 @@ def build_cycles_preset(upload_id: str, code_to_name: Dict[str, str], use_llm: b
     return base
 
 __all__ = [
-    "ALLOWED_CYCLES",
-    "CYCLE_KO",
-    "code_to_ko",
-    "ko_to_code",
-    "set_cycles_map",
-    "get_cycles_map",
-    "get_effective_cycles",
-    "rule_based_guess",
-    "accounts_for_cycles",
-    "accounts_for_cycles_ko",
-    "merge_cycles",
-    "build_cycles_preset",
+    "ALLOWED_CYCLES","CYCLE_KO","code_to_ko","ko_to_code",
+    "set_cycles_map","get_cycles_map","get_effective_cycles",
+    "get_cycles_preset","accounts_for_cycles","accounts_for_cycles_ko",
+    "rule_based_guess","merge_cycles","build_cycles_preset",
 ]

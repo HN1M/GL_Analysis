@@ -1,11 +1,37 @@
 # timeseries.py
 # v3 — Compact TS module with PY+CY window, MoR(EMA/MA/ARIMA/Prophet), dual-basis(flow/balance)
 from __future__ import annotations
-from typing import Any, Dict, List, Optional, Tuple, Callable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Mapping
 import math
 import numpy as np
+STANDARD_COLS = ["date","account","measure","model","actual","predicted","error","z","risk"]
+
+def _ensure_ts_schema(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    시계열 결과 DF를 표준 스키마로 정규화한다.
+    누락된 컬럼은 NaN으로 추가하고, date는 datetime으로 강제.
+    """
+    if df is None or len(df) == 0:
+        return pd.DataFrame(columns=STANDARD_COLS)
+    out = df.copy()
+    if "date" in out.columns:
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    for c in STANDARD_COLS:
+        if c not in out.columns:
+            out[c] = np.nan
+    # 불필요 컬럼은 보존하되, 기준 컬럼 우선 반환
+    extra = [c for c in out.columns if c not in STANDARD_COLS]
+    return out[STANDARD_COLS + extra]
 import pandas as pd
 import plotly.graph_objects as go
+from pandas.tseries.offsets import MonthEnd
+def to_month_end_index(idx) -> pd.DatetimeIndex:
+    """Convert a datetime-like or period-like index to month-end DatetimeIndex.
+    NEW: Always normalize to month-end 00:00:00 (floor to day) for stable axes.
+    """
+    pidx = pd.PeriodIndex(idx, freq="M")
+    _end = pidx.to_timestamp(how="end").floor("D")
+    return pd.DatetimeIndex(_end)
 
 # Attempt to import visualization and helper utilities (assuming they exist in the project structure)
 try:
@@ -63,8 +89,43 @@ except Exception:
         return _risk_from_fallback(z_abs, amount, pm)
 
 # ----------------------------- Utilities ------------------------------
+DATE_CANDIDATES = ['회계일자','전표일자','거래일자','일자','date','Date']
+AMT_CANDIDATES  = ['거래금액','발생액','금액','금액(원)','거래금액_절대값','발생액_절대값','순액','순액(원)']
+
+def _pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
 def _to_month_period_index(dates: pd.Series) -> pd.PeriodIndex:
     return pd.to_datetime(dates).dt.to_period("M")
+
+def _to_month_end(ts: pd.Series) -> pd.Series:
+    """Normalize datetimes to month-end and floor to seconds for clean display."""
+    ts = pd.to_datetime(ts, errors="coerce")
+    return (ts + MonthEnd(0)).dt.floor("S")
+
+def _monthly_flow_and_balance(
+    df: pd.DataFrame,
+    date_col: str,
+    amount_col: str,
+    opening: float = 0.0,
+) -> Tuple[pd.Series, pd.Series]:
+    """월별 발생액 합계(flow)와 기초+누적발생액(balance) 반환.
+    반환 Series는 month-end DatetimeIndex를 가지며 index.name="date"로 설정된다.
+    """
+    if df is None or df.empty:
+        idx = pd.DatetimeIndex([], name="date")
+        return pd.Series(dtype=float, index=idx), pd.Series(dtype=float, index=idx)
+    p = pd.to_datetime(df[date_col], errors="coerce").dt.to_period("M")
+    amt = pd.to_numeric(df[amount_col], errors="coerce").fillna(0.0)
+    flow = amt.groupby(p).sum().astype(float)
+    balance = (flow.cumsum() + float(opening)).astype(float)
+    month_end = flow.index.to_timestamp(how="end").floor("D")
+    flow_s = pd.Series(flow.values, index=month_end)
+    bal_s = pd.Series(balance.values, index=month_end)
+    flow_s.index.name = bal_s.index.name = "date"
+    return flow_s, bal_s
 
 def _longest_contiguous_month_run(periods: pd.PeriodIndex) -> pd.PeriodIndex:
     if len(periods) <= 1: return periods
@@ -237,7 +298,9 @@ def _choose_model(y: pd.Series, measure: str) -> Tuple[str, np.ndarray]:
 def _prepare_monthly(df: pd.DataFrame, date_col: str = "date") -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame(columns=[date_col]).copy()
-    p = _to_month_period_index(df[date_col])
+    # 월말 기준으로 고정
+    _dates = pd.to_datetime(df[date_col], errors="coerce")
+    p = _to_month_period_index(_dates)
     df2 = df.copy()
     df2["_p"] = p
     df2 = df2.dropna(subset=["_p"]).sort_values("_p")
@@ -260,10 +323,8 @@ def _one_track_lastrow(
     sigma = _std_last(resid, w=6)
     z = float(error_last / sigma) if sigma > 0 else 0.0
     risk = _risk_score(abs(z), amount=float(y.iloc[-1]), pm=float(pm_value))
-    # 날짜 앵커: flow=월초(how='start'), balance=월말(how='end')
-    _how = 'start' if measure == 'flow' else 'end'
     return {
-        "date": df["_p"].iloc[-1].to_timestamp(how=_how),
+        "date": y.index[-1].to_timestamp(how='end'),
         "measure": measure,
         "actual": float(y.iloc[-1]),
         "predicted": float(yhat[-1]),
@@ -314,7 +375,7 @@ def run_timeseries_for_account(
         out = out.sort_values(["account","measure","date"]).reset_index(drop=True)
     else:
         out = pd.DataFrame(columns=["date","account","measure","actual","predicted","error","z","risk","model"])
-    return out
+    return _ensure_ts_schema(out)
 
 def run_timeseries_module(
     df: pd.DataFrame,
@@ -322,6 +383,7 @@ def run_timeseries_module(
     account_col: str = "account",
     date_col: str = "date",
     amount_col: str = "amount",
+    targets: Optional[List[str]] = None,
     pm_value: float = _PM_DEFAULT,
     make_balance: bool = False,  # 기본값 False로 변경: 필요 시 balance 구성
     output: str = "all",        # "all" | "flow" | "balance"
@@ -334,14 +396,21 @@ def run_timeseries_module(
     output으로 최종 반환 필터링 가능("flow"/"balance").
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
+        return _ensure_ts_schema(pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"]))
     work = df[[account_col, date_col, amount_col]].copy()
     work.columns = ["account","date","amount"]
     work = work.sort_values(["account","date"])
+    if targets:
+        try:
+            tgt = set(map(str, targets))
+            work["account"] = work["account"].astype(str)
+            work = work[work["account"].isin(tgt)]
+        except Exception:
+            pass
     # 최소 포인트 가드: 계정별 date 유니크가 부족하면 빈 결과 반환
     MIN_POINTS = 6
     if work["date"].nunique() < MIN_POINTS:
-        return pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
+        return _ensure_ts_schema(pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"]))
     all_rows: List[pd.DataFrame] = []
     for acc, g in work.groupby("account", dropna=False):
         mon = g[["date","amount"]].rename(columns={"amount":"flow"}).copy()
@@ -378,47 +447,52 @@ def run_timeseries_module(
                     d["assertion"] = "E"
             rows.append(evidence_adapter(d))
         return rows  # type: ignore[return-value]
-    return result
+    return _ensure_ts_schema(result)
 
 def run_timeseries_module_with_flag(
     df: pd.DataFrame,
+    account_col: str,
+    date_col: str,
+    amount_col: str,
+    account_name: str,
+    is_bs: bool,
+    backend: str = "ema",
     *,
-    account_col: str = "account",
-    date_col: str = "date",
-    amount_col: str = "amount",
-    is_bs_col: str = "is_bs",
-    pm_value: float = _PM_DEFAULT,
+    opening_map: Mapping[str, float] | None = None,
+    return_mode: str = "insample",
 ) -> pd.DataFrame:
     """
-    혼합 데이터셋에서 계정별 BS 여부에 따라 듀얼(Flow+Balance) 또는 단일(Flow)로 처리.
-    - is_bs=True: flow + balance(누적합) 계산
-    - is_bs=False: flow만 계산
-    반환 컬럼: ["account","date","measure","actual","predicted","error","z","risk","model"]
+    기존 단일 출력에서 확장: BS 계정은 balance/flow dual 로직 적용.
+    balance = opening(전기말잔액 등) + flow.cumsum()
     """
     if df is None or df.empty:
-        return pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
-    work = df[[account_col, date_col, amount_col, is_bs_col]].copy()
-    work.columns = ["account","date","amount","is_bs"]
-    work = work.sort_values(["account","date"])
-    outs: List[pd.DataFrame] = []
-    for acc, g in work.groupby("account", dropna=False):
-        is_bs = bool(g["is_bs"].iloc[-1])
-        mon = g[["date","amount"]].rename(columns={"amount":"flow"}).copy()
-        balance_col = None
-        if is_bs:
-            mon["balance"] = mon["flow"].astype(float).cumsum()
-            balance_col = "balance"
-        out = run_timeseries_for_account(
-            mon, str(acc), is_bs=is_bs, flow_col="flow",
-            balance_col=balance_col, pm_value=float(pm_value)
-        )
-        if not out.empty:
-            try:
-                out["assertion"] = out["error"].map(lambda e: "E" if float(e) > 0 else "C")
-            except Exception:
-                out["assertion"] = "E"
-        outs.append(out)
-    return pd.concat(outs, ignore_index=True) if outs else pd.DataFrame(columns=["account","date","measure","actual","predicted","error","z","risk","model"])
+        return _ensure_ts_schema(pd.DataFrame(columns=["date","account","measure","actual","predicted","error","z","risk","model"]))
+
+    # 월별 flow/balance 생성 (월말 00:00:00 보장)
+    acct = str(df[account_col].iloc[0]) if (account_col in df.columns and not df.empty) else account_name
+    opening = 0.0
+    if opening_map:
+        opening = float(opening_map.get(acct, opening_map.get(account_name, 0.0)))
+    flow_s, bal_s = _monthly_flow_and_balance(df, date_col, amount_col, opening=opening)
+
+    def _run(track: str, s: pd.Series) -> pd.DataFrame:
+        base = pd.DataFrame({"date": s.index, track: s.values}).sort_values("date")
+        if return_mode == "lastrow":
+            ins = base.tail(1).rename(columns={track: "actual"})
+            ins["predicted"] = np.nan; ins["error"] = np.nan; ins["z"] = np.nan; ins["risk"] = np.nan
+            ins["model"] = backend.upper()
+        else:
+            ins = insample_predict_df(base, value_col=track, measure=track, pm_value=_PM_DEFAULT)
+        ins["account"] = account_name
+        ins["measure"] = track
+        ins["date"] = to_month_end_index(ins["date"])  # 안전 보정
+        return ins[["date","account","measure","actual","predicted","error","z","risk","model"]]
+
+    res = [_run("flow", flow_s)]
+    if is_bs:
+        res.append(_run("balance", bal_s))
+    final_df = pd.concat(res, ignore_index=True).sort_values(["measure","date"]) if res else pd.DataFrame(columns=["date","account","measure","actual","predicted","error","z","risk","model"])
+    return _ensure_ts_schema(final_df)
 
 # ----------------------- Helper: in-sample prediction -------------------
 def insample_predict_df(
@@ -439,9 +513,10 @@ def insample_predict_df(
         return pd.DataFrame(columns=["date","actual","predicted","model","train_months","data_span","sigma_win","measure","value_col"])
     model, yhat = _choose_model(y, measure=measure)
     span = f"{y.index[0].strftime('%Y-%m')} ~ {y.index[-1].strftime('%Y-%m')}"
-    _how = 'start' if measure == 'flow' else 'end'
+    # 월말 고정 + 초 단위로 내림
+    idx = to_month_end_index(y.index)
     out = pd.DataFrame({
-        "date": y.index.to_timestamp(how=_how),
+        "date": idx,
         "actual": y.values,
         "predicted": yhat,
         "model": model,
@@ -631,28 +706,45 @@ def create_timeseries_figure(
     measure: str,
     title: str,
     pm_value: float,
-    show_dividers: bool = True
+    show_dividers: bool = False
 ) -> Tuple[Optional[go.Figure], Optional[Dict[str, Any]]]:
     """
     Creates a timeseries figure (actual vs predicted) and returns the figure and stats.
     (Refactored from app.py's _make_ts_fig_with_stats, removing Streamlit dependencies)
     """
     vcol = 'flow' if measure == 'flow' else 'balance'
-    if vcol not in df_hist.columns:
-        return None, {"error": f"Column '{vcol}' not found in data."}
+    work = df_hist.copy()
+    if "date" not in work.columns:
+        return None, {"error": "Column 'date' not found in data."}
+    work["date"] = pd.to_datetime(work["date"], errors="coerce")
+    work = work.dropna(subset=["date"]).sort_values("date")
 
-    base = df_hist[['date', vcol]].rename(columns={vcol: 'val'}).sort_values('date')
-
-    # Use insample_predict_df which internally handles MoR
-    ins = insample_predict_df(
-        base.rename(columns={'val': vcol}),
-        value_col=vcol,
-        measure=measure,
-        pm_value=float(pm_value)
-    )
+    # 1) 모델링된 입력(actual/predicted)이면 그대로 사용
+    if {"actual","predicted"}.issubset(work.columns):
+        cols = ["date","actual","predicted"] + (["model"] if "model" in work.columns else [])
+        ins = work[cols].copy()
+    else:
+        # 2) 값 컬럼을 잡아 in-sample 예측선 생성
+        if vcol in work.columns:
+            base = work[["date", vcol]].rename(columns={vcol: "val"})
+        elif "actual" in work.columns:
+            base = work[["date","actual"]].rename(columns={"actual":"val"})
+        elif "value" in work.columns:
+            base = work[["date","value"]].rename(columns={"value":"val"})
+        else:
+            return None, {"error": f"Neither '{vcol}' nor 'actual'/'value' column found."}
+        base = base.dropna(subset=["val"])  # 안전 가드
+        ins = insample_predict_df(
+            base.rename(columns={"val": vcol}),
+            value_col=vcol,
+            measure=measure,
+            pm_value=float(pm_value)
+        )
 
     if ins.empty or len(ins) < 2:
-        return None, {"error": "Insufficient data points for prediction."}
+        reason = "points<2" if (not ins.empty) else "empty"
+        return None, {"error": f"Insufficient data for plot ({reason}).",
+                      "diagnostics": {"n_months": int(len(ins))}}
 
     # --- 1. Figure Creation ---
     fig = go.Figure()
@@ -673,7 +765,7 @@ def create_timeseries_figure(
     except Exception:
         pass  # Proceed without PM line if utility fails
 
-    # Add time dividers (Year/Quarter)
+    # Add time dividers (Year/Quarter) – 기본 OFF
     if show_dividers:
         try:
             fig = add_period_guides(fig, ins['date'])
@@ -706,7 +798,7 @@ def create_timeseries_figure(
     mape = float(np.mean(np.where(actuals != 0, np.abs((actuals - predicted) / actuals) * 100, 0)))
 
     aic = bic = np.nan
-    best_model_name = str(ins['model'].iloc[-1])
+    best_model_name = str(ins['model'].iloc[-1]) if ('model' in ins.columns and not ins.empty) else "EMA"
 
     if best_model_name.upper() == "ARIMA":
         try:
@@ -753,9 +845,16 @@ def create_timeseries_figure(
     reasoning_text = model_reason_text(best_model_name, diagnostics_for_reasoning)
 
     # Metadata
-    train_months = int(ins['train_months'].iloc[-1])
-    span_txt = str(ins['data_span'].iloc[-1])
-    sigma_window = int(ins['sigma_win'].iloc[-1])
+    train_months = int(ins['train_months'].iloc[-1]) if 'train_months' in ins.columns else int(len(ins))
+    if 'data_span' in ins.columns and not ins['data_span'].empty:
+        span_txt = str(ins['data_span'].iloc[-1])
+    else:
+        try:
+            dmin = ins['date'].min(); dmax = ins['date'].max()
+            span_txt = f"{dmin:%Y-%m} ~ {dmax:%Y-%m}"
+        except Exception:
+            span_txt = "-"
+    sigma_window = int(ins['sigma_win'].iloc[-1]) if 'sigma_win' in ins.columns else 6
 
     stats_output["metrics"] = {"mae": mae, "mape": mape, "aic": aic, "bic": bic}
     stats_output["metadata"] = {
@@ -771,3 +870,75 @@ def create_timeseries_figure(
     }
 
     return fig, stats_output
+
+
+# --------------------------- Lightweight series API ---------------------------
+def build_series(ledger, accounts: List[str]) -> Tuple[pd.DataFrame, str]:
+    """
+    원장(ledger.df)에서 날짜/금액 컬럼을 자동 탐색하여 월별 시계열을 생성.
+    - 정상(ledger 모드): 원장에서 월별 합계를 산출하여 tidy 반환
+    - 폴백(master 모드): meta.master_df의 잔액 3포인트(전전기말/전기말/당기말)를 반환
+
+    반환: (df, mode)
+      df columns → ['계정코드','계정명','month','value']
+      mode → 'ledger' | 'master'
+    """
+    df = getattr(ledger, 'df', None)
+    if df is None or df.empty:
+        return pd.DataFrame(columns=['계정코드','계정명','month','value']), 'master'
+
+    # 계정 필터 준비(문자열 통일)
+    accounts = list(map(str, accounts or []))
+    work = df.copy()
+    if '계정코드' in work.columns:
+        try:
+            work['계정코드'] = work['계정코드'].astype(str)
+        except Exception:
+            pass
+
+    date_col = _pick_col(work, DATE_CANDIDATES)
+    amt_col  = _pick_col(work, AMT_CANDIDATES)
+
+    if date_col and amt_col and ('계정코드' in work.columns) and ('계정명' in work.columns):
+        # 날짜/금액 안전 정규화
+        work[date_col] = pd.to_datetime(work[date_col], errors='coerce')
+        work[amt_col] = pd.to_numeric(work[amt_col], errors='coerce')
+        work = work.dropna(subset=[date_col, amt_col, '계정코드', '계정명'])
+
+        # 대상 계정 필터 → 월말 고정
+        tmp = work[work['계정코드'].astype(str).isin(accounts)].copy()
+        if tmp.empty:
+            return pd.DataFrame(columns=['계정코드','계정명','month','value']), 'ledger'
+        tmp['_month'] = tmp[date_col].dt.to_period('M').dt.to_timestamp(how='end').floor('D')
+        mon = (tmp.groupby(['계정코드','계정명','_month'], as_index=False)[amt_col].sum())
+        mon = mon.rename(columns={'_month': 'month', amt_col: 'value'}).sort_values(['계정코드','month'])
+        return mon, 'ledger'
+
+    # --- 폴백: master 잔액 3포인트 ---
+    m = getattr(ledger, 'meta', {}).get('master_df') if hasattr(ledger, 'meta') else None
+    need = {'전전기말잔액','전기말잔액','당기말잔액'}
+    if m is None or not need.issubset(set(m.columns)):
+        # 완전 폴백 실패 시 빈 프레임 반환(호출측에서 메시지 처리)
+        return pd.DataFrame(columns=['계정코드','계정명','month','value']), 'master'
+    try:
+        cy = int(getattr(ledger, 'meta', {}).get('CY', pd.Timestamp.today().year))
+    except Exception:
+        cy = pd.Timestamp.today().year
+    dates = [pd.Timestamp(cy-2, 12, 31), pd.Timestamp(cy-1, 12, 31), pd.Timestamp(cy, 12, 31)]
+    m2 = m.copy()
+    try:
+        m2['계정코드'] = m2['계정코드'].astype(str)
+    except Exception:
+        pass
+    mm = m2[m2['계정코드'].isin(accounts)][['계정코드','계정명','전전기말잔액','전기말잔액','당기말잔액']]
+    rows: List[pd.DataFrame] = []
+    for _, r in mm.iterrows():
+        vals = [r.get('전전기말잔액', 0), r.get('전기말잔액', 0), r.get('당기말잔액', 0)]
+        rows.append(pd.DataFrame({
+            '계정코드': r['계정코드'],
+            '계정명' : r['계정명'],
+            'month' : dates,
+            'value' : vals
+        }))
+    g = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=['계정코드','계정명','month','value'])
+    return g, 'master'

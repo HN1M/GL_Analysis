@@ -14,15 +14,17 @@ import pandas as pd
 import numpy as np
 import re
 from pathlib import Path
+import plotly.graph_objects as go
 from utils.helpers import find_column_by_keyword, add_provenance_columns, add_period_tag
 from analysis.integrity import analyze_reconciliation, run_integrity_module
 from analysis.contracts import LedgerFrame, ModuleResult
 from analysis.trend import create_monthly_trend_figure, run_trend_module
 from analysis.timeseries import (
-    model_registry,
-    run_timeseries_module_with_flag,
-    create_timeseries_figure
+    run_timeseries_module,          # ← 보고서 탭에서 계속 사용
+    create_timeseries_figure        # ← 그래프 렌더 그대로 사용
 )
+from analysis.ts_v2 import run_timeseries_minimal  # ← 새 최소 러너(EMA)
+from analysis.aggregation import aggregate_monthly, month_end_00
 from analysis.anomaly import run_anomaly_module, compute_amount_columns
 from analysis.correlation import run_correlation_module
 from analysis.vendor import (
@@ -438,7 +440,7 @@ if uploaded_file is not None:
                             st.write("- " + line)
                     else:
                         st.success("문제 없이 깔끔합니다!")
-                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🧠 분석 종합 대시보드"])
+                tab_integrity, tab_vendor, tab_anomaly, tab_ts, tab_report, tab_corr_adv = st.tabs(["🌊 데이터 무결성 및 흐름", "🏢 거래처 심층 분석", "🔬 이상 패턴 탐지", "📉 시계열 예측", "🧠 분석 종합 대시보드", "📊 상관관계(고급)"])
 
                 # (이전 버전) 대시보드 탭은 사용자 요청으로 제거됨
                 with tab_integrity:  # ...
@@ -581,15 +583,7 @@ if uploaded_file is not None:
                         if 'strong_pairs' in cmod.tables and not cmod.tables['strong_pairs'].empty:
                             st.markdown("**임계치 이상 상관쌍**")
                             sp = cmod.tables['strong_pairs'].copy()
-                            name_map = dict(zip(
-                                mdf["계정코드"].astype(str),
-                                mdf["계정명"].astype(str)
-                            ))
-                            for col in ["계정코드_A", "계정코드_B"]:
-                                sp[col] = sp[col].astype(str)
-                            sp.insert(0, "계정명_A", sp["계정코드_A"].map(name_map))
-                            sp.insert(1, "계정명_B", sp["계정코드_B"].map(name_map))
-                            sp = sp[["계정명_A", "계정명_B", "상관계수", "계정코드_A", "계정코드_B"]]
+                            # 이미 correlation 모듈에서 계정명 컬럼을 assign으로 생성하므로 그대로 표시
                             st.dataframe(sp, use_container_width=True, height=320)
                         if 'excluded_accounts' in cmod.tables and not cmod.tables['excluded_accounts'].empty:
                             with st.expander("제외된 계정 보기(변동없음/활동월 부족)", expanded=False):
@@ -718,7 +712,7 @@ if uploaded_file is not None:
 
                 with tab_ts:
                     st.header("시계열 예측")
-                    with st.expander("🧭 해석 가이드", expanded=False):
+                    with st.expander("🧭 해석 가이드", expanded=False, icon=":material/help:"):
                         st.markdown(
                             """
 ### 용어
@@ -747,183 +741,376 @@ if uploaded_file is not None:
 > :blue[**모델은 계정×기준(Flow/Balance)별로 교차검증 오차(MAPE/MAE)와 (가능하면) 정보량(AIC/BIC)을 종합해 자동 선택됩니다.**]
 """
                         )
-                    # 모델 가용 배지(디버깅 겸 사용자 안내)
-                    try:
-                        # model_registry is imported at the top
-                        _reg = model_registry()
-                        st.caption(f"지원 모델: EMA ✓ · MA ✓ · ARIMA {'✓' if _reg['arima'] else '—'} · Prophet {'✓' if _reg['prophet'] else '—'}")
-                    except Exception:
-                        pass
-                    # (중복 가이드 제거됨)
-                    lf_use = _lf_by_scope()
-                    mdf = st.session_state.master_df
-                    dfm = lf_use.df.copy()
-                    dfm['연월'] = dfm['회계일자'].dt.to_period('M').dt.to_timestamp('M')
-                    agg = (dfm.groupby(['계정명','연월'])['거래금액'].sum()
-                               .reset_index().rename(columns={'계정명':'account','연월':'date','거래금액':'amount'}))
-                    pick_accounts_ts = st.multiselect("대상 계정", sorted(agg['account'].unique()), default=[], key="ts_accounts")
-                    use_ts = agg if not pick_accounts_ts else agg[agg['account'].isin(pick_accounts_ts)]
-                    # BS 여부를 반영해 balance 기준도 병행 계산
-                    try:
-                        bs_map = st.session_state.master_df[['계정명','BS/PL']].drop_duplicates()
-                        _bs_flag = bs_map.set_index('계정명')['BS/PL'].map(lambda x: str(x).upper()== 'BS').to_dict()
-                    except Exception:
-                        _bs_flag = {}
-                    work_ts = use_ts.copy()
-                    work_ts['is_bs'] = work_ts['account'].map(lambda name: bool(_bs_flag.get(str(name), False)))
 
-                    res = run_timeseries_module_with_flag(work_ts,
-                                       account_col='account', date_col='date', amount_col='amount', is_bs_col='is_bs',
-                                       pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
-                    if not res.empty:
-                        out = res.copy()
-                        out = out.rename(columns={'account':'계정'})
-                        for c in ['actual','predicted','error','z','risk']:
-                            out[c] = pd.to_numeric(out[c], errors='coerce')
-                        # 사용자 친화적 표기(기준): 발생액/잔액
+                    # 0) 원장/세션 확보
+                    master_df: pd.DataFrame = st.session_state.get("master_df", pd.DataFrame())
+                    if master_df.empty:
+                        st.info("원장 데이터가 없습니다.")
+                        st.stop()
+
+                    # --- state bootstrap --- (위젯 생성 전에 실행)
+                    st.session_state.setdefault("ts_accounts_names", [])
+                    st.session_state.setdefault("ts_cycles_ko", [])
+                    st.session_state.setdefault("ts_acc_buffer", None)
+                    st.session_state.setdefault("ts_acc_needs_update", False)
+
+                    # --- preset 주입 훅: rerun 직후, 멀티셀렉트 생성 '이전'에 1회 주입 ---
+                    if st.session_state.ts_acc_needs_update and st.session_state.ts_acc_buffer is not None:
+                        st.session_state.ts_accounts_names = st.session_state.ts_acc_buffer
+                        st.session_state.ts_acc_needs_update = False
+
+                    upload_id = getattr(uploaded_file, 'name', '_default')
+
+                    # 두 컨테이너로 시각 순서는 유지(계정 위, 프리셋 아래) + 코드 순서 제어
+                    box_accounts = st.container()
+                    box_preset = st.container()
+
+                    # Helper: 프리셋(KO 라벨) → 계정명 리스트로 확장
+                    def expand_cycles_to_account_names(*, upload_id: str, cycles_ko: list[str], master_df: pd.DataFrame) -> list[str]:
                         try:
-                            out['measure'] = out['measure'].map(lambda m: '발생액(flow)' if str(m)=='flow' else ('잔액(balance)' if str(m)=='balance' else str(m)))
+                            mapping = cyc.get_effective_cycles(upload_id)
+                            codes = cyc.accounts_for_cycles_ko(mapping, cycles_ko)
+                            df_map = master_df[["계정코드","계정명"]].dropna().copy()
+                            df_map["계정코드"] = df_map["계정코드"].astype(str)
+                            code_to_name = df_map.drop_duplicates("계정코드").set_index("계정코드")["계정명"].astype(str).to_dict()
+                            names = [code_to_name.get(str(c), str(c)) for c in codes]
+                            # 유니크+순서보존
+                            return list(dict.fromkeys([n for n in names if n]))
+                        except Exception:
+                            return []
+
+                    # (아래) 프리셋 영역: 버튼으로 버퍼만 갱신
+                    with box_preset:
+                        st.markdown("#### 사이클 프리셋 선택(선택 시 위 계정 목록에 **적용 버튼**으로 반영)")
+                        chosen_cycles = st.multiselect(
+                            "사이클 프리셋",
+                            options=list(cyc.CYCLE_KO.values()),
+                            key="ts_cycles_ko",
+                        )
+                        if st.button("➕ 프리셋 적용", key="ts_apply_preset"):
+                            names_from_cycles = expand_cycles_to_account_names(
+                                upload_id=upload_id,
+                                cycles_ko=st.session_state.ts_cycles_ko,
+                                master_df=master_df,
+                            )
+                            merged = list(dict.fromkeys([
+                                *st.session_state.ts_accounts_names,
+                                *names_from_cycles,
+                            ]))
+                            st.session_state.ts_acc_buffer = merged
+                            st.session_state.ts_acc_needs_update = True
+                            st.rerun()
+
+                    # (위) 계정 영역: 멀티셀렉트 그리기(값 주입은 상단 훅이 담당)
+                    with box_accounts:
+                        all_account_names = (
+                            master_df["계정명"].dropna().astype(str).sort_values().unique().tolist()
+                        )
+                        picked_names = st.multiselect(
+                            "대상 계정(복수 선택 가능)",
+                            options=all_account_names,
+                            key="ts_accounts_names",
+                            help="선택한 계정에 대해서만 예측 테이블/그래프를 생성합니다."
+                        )
+
+                    if not picked_names:
+                        st.info("시계열 결과가 없습니다. (선택한 계정/기간에 데이터 없음)")
+                        st.stop()
+
+                    # 2) 계정명 → 계정코드
+                    name_to_code = (
+                        master_df.dropna(subset=["계정명","계정코드"]).astype({"계정명":"string","계정코드":"string"})
+                                 .drop_duplicates(subset=["계정명"]).set_index("계정명")["계정코드"].to_dict()
+                    )
+                    want_codes = [name_to_code.get(n) for n in picked_names if n in name_to_code]
+
+                    # 3) 정식 시계열 파이프라인: ledger → 월별집계(flow) → balance(opening+누적) → 예측/진단/그림
+                    lf_use = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
+                    if lf_use is None:
+                        st.info("원장을 먼저 업로드해 주세요.")
+                        st.stop()
+
+                    # (1) 분석 대상 슬라이스
+                    ldf = lf_use.df.copy()
+                    ldf = ldf[ldf['계정코드'].astype(str).isin([str(x) for x in want_codes])]
+
+                    # (2) 필수 파생: 발생액/순액 보장
+                    from analysis.anomaly import compute_amount_columns
+                    ldf = compute_amount_columns(ldf)
+
+                    # (3) 날짜/금액 컬럼 픽업(없으면 안전 종료)
+                    from analysis.timeseries import DATE_CANDIDATES, AMT_CANDIDATES
+                    date_col = next((c for c in DATE_CANDIDATES if c in ldf.columns), None)
+                    amount_col = next((c for c in AMT_CANDIDATES if c in ldf.columns), None)
+                    if not date_col or not amount_col:
+                        st.error(
+                            "필수 컬럼을 찾지 못했습니다.\n"
+                            f"- 날짜 후보: {DATE_CANDIDATES}\n- 금액 후보: {AMT_CANDIDATES}\n\n"
+                            f"현재 컬럼: {list(ldf.columns)}"
+                        )
+                        st.stop()
+
+                    # (4) opening(전기말잔액) 맵 구성
+                    opening_map = {}
+                    if "전기말잔액" in master_df.columns and "계정코드" in master_df.columns:
+                        opening_map = (
+                            master_df[["계정코드","전기말잔액"]]
+                            .dropna(subset=["계정코드"])
+                            .assign(전기말잔액=lambda d: pd.to_numeric(d["전기말잔액"], errors="coerce").fillna(0.0))
+                            .groupby("계정코드")["전기말잔액"].first().to_dict()
+                        )
+
+                    # (5) BS/PL 플래그
+                    is_bs_map = {}
+                    if "BS/PL" in master_df.columns and "계정코드" in master_df.columns:
+                        is_bs_map = (
+                            master_df.dropna(subset=["계정코드","BS/PL"])
+                            .astype({"계정코드":"string","BS/PL":"string"})
+                            .drop_duplicates(subset=["계정코드"])
+                            .assign(is_bs=lambda d: d["BS/PL"].str.upper().eq("BS"))
+                            .set_index("계정코드")["is_bs"].to_dict()
+                        )
+
+                    # (6) 모델 선택(레지스트리)
+                    st.caption("모형: EMA(고정). 복잡 러너는 비활성화되었습니다.")
+                    backend = "ema"
+
+                    PM = float(st.session_state.get("pm_value", PM_DEFAULT))
+                    # (7) 계정별 실행: 결과 수집용 버퍼
+                    gathered_flow = []
+                    gathered_balance = []
+                    results_per_account = {}
+
+                    for code in want_codes:
+                        sub = ldf[ldf["계정코드"].astype(str) == str(code)].copy()
+                        if sub.empty:
+                            continue
+                        acc_name = (master_df[master_df["계정코드"].astype(str)==str(code)]["계정명"].dropna().astype(str).head(1).tolist() or [str(code)])[0]
+                        is_bs = bool(is_bs_map.get(str(code), False))
+
+                        PM = float(st.session_state.get("pm_value", PM_DEFAULT))
+                        opening = 0.0
+                        if isinstance(opening_map, dict):
+                            opening = float(opening_map.get(str(code), 0.0))
+
+                        out = run_timeseries_minimal(
+                            sub,
+                            account_name=acc_name,
+                            date_col=date_col,
+                            amount_col=amount_col,
+                            is_bs=bool(is_bs),
+                            opening=opening,
+                            pm_value=PM
+                        )
+
+                        # (수집) 통합 요약표(1행) + 그래프(다포인트) 분리
+                        if not out.empty:
+                            tmp = out.copy()
+                            tmp.insert(0, "계정", acc_name)
+                            # 그래프/진단용(전 구간)
+                            results_per_account[acc_name] = tmp
+                            # 요약표(마지막 1행만)
+                            last_flow = tmp[tmp["measure"].eq("flow")].tail(1)
+                            if not last_flow.empty: gathered_flow.append(last_flow)
+                            if is_bs:
+                                last_bal = tmp[tmp["measure"].eq("balance")].tail(1)
+                                if not last_bal.empty: gathered_balance.append(last_bal)
+
+                    # === NEW: 통합 테이블(그래프보다 위에 한 번만) ===
+                    def _render_table(blocks, title):
+                        if not blocks:
+                            return
+                        tbl = pd.concat(blocks, ignore_index=True)
+                        show_cols = ["계정","date","actual","predicted","error","z","risk","model"]
+                        present = [c for c in show_cols if c in tbl.columns]
+                        for c in show_cols:
+                            if c not in tbl.columns:
+                                tbl[c] = np.nan
+                        # 안전 가드: 수치형 변환(누락 컬럼은 위에서 NaN 보강)
+                        try:
+                            num_cols = [c for c in ["actual","predicted","error","z","risk"] if c in tbl.columns]
+                            if num_cols:
+                                tbl[num_cols] = tbl[num_cols].apply(pd.to_numeric, errors='coerce')
                         except Exception:
                             pass
-                        _disp = out[['date','계정','measure','model','actual','predicted','error','z','risk']].rename(columns={
-                            'date': '월',
-                            'measure': '기준(Measure)',
-                            'model': '모델(MoR)',
-                            'actual': '실제(월 합계)',
-                            'predicted': '예측(월 합계)',
-                            'error': '차이(실제-예측)',
-                            'z': '표준화지수(z)',
-                            'risk': '위험도(0~1)'
-                        })
-                        st.caption("MoR(최적 모델) 기준. BS 계정은 balance 기준도 함께 표시합니다.")
-                        st.dataframe(_disp.style.format({
-                            '실제(월 합계)':'{:,.0f}', '예측(월 합계)':'{:,.0f}', '차이(실제-예측)':'{:,.0f}', '표준화지수(z)':'{:+.2f}', '위험도(0~1)':'{:.2f}'
-                        }), use_container_width=True)
-
-                        # === 라인차트 ===
-                        st.markdown("#### 라인차트")
-                        # 월별 집계에서 flow/balance 히스토리 구성
-                        hist_base = use_ts.rename(columns={'amount':'flow'}).sort_values('date').copy()
-                        hist_base['balance'] = hist_base['flow']
-                        # 계정별 opening (=전기말잔액) 맵
-                        _open = st.session_state.master_df[['계정명','전기말잔액']].drop_duplicates()
-                        opening_map = _open.set_index('계정명')['전기말잔액'].to_dict()
-
-                        def _apply_opening(g):
-                            acc_name = str(g['account'].iloc[0])
-                            opn = float(opening_map.get(acc_name, 0.0))
-                            g = g.copy()
-                            g['balance'] = opn + g['flow'].astype(float).cumsum()
-                            return g
-
-                        hist_base = hist_base.groupby('account', group_keys=False).apply(_apply_opening)
-
-                        # 계정 선택
-                        sel_acc = st.selectbox("계정 선택(라인차트)", sorted(hist_base['account'].unique()), key="ts_plot_acc_main")
-
-                        # BS/PL 판단
-                        _mdf = st.session_state.master_df[['계정코드','계정명','BS/PL','차변/대변']].drop_duplicates()
-                        is_bs = bool(_mdf[_mdf['계정명'] == sel_acc]['BS/PL'].astype(str).str.upper().eq('BS').any())
-
-                        cur_hist = hist_base[hist_base['account'] == sel_acc].copy()
-                        if cur_hist.empty:
-                            st.info("선택 계정의 월별 데이터가 없습니다.")
-                        else:
-                            # (기존 학습/모델 표기 로직 제거 — create_timeseries_figure에서 메타와 지표 제공)
-
-                            # 대변계정(부채·자본·수익)인 경우 그래프 부호 반전
+                        # 사용자 친화 표기: measure 라벨 매핑(있는 경우)
+                        if 'measure' in tbl.columns:
                             try:
-                                from utils.helpers import is_credit_account
-                                # Master에서 해당 계정의 속성 조회
-                                _row = _mdf[_mdf['계정명'] == sel_acc].iloc[0] if not _mdf[_mdf['계정명'] == sel_acc].empty else None
-                                acc_type = _row.get('BS/PL', 'PL') if _row is not None else 'PL'
-                                dc_flag = _row.get('차변/대변') if _row is not None else None
-                                if is_credit_account(acc_type if acc_type in ['부채','자본','수익'] else None, dc_flag):
-                                    cur_hist = cur_hist.copy()
-                                    cur_hist['flow'] = -cur_hist['flow']
-                                    cur_hist['balance'] = -cur_hist['balance']
+                                tbl['measure'] = tbl['measure'].map(lambda m: '발생액(Flow)' if str(m) == 'flow' else ('잔액(Balance)' if str(m) == 'balance' else str(m)))
                             except Exception:
                                 pass
+                        tbl = tbl[show_cols].rename(columns={
+                            "date":"일자","actual":"실측","predicted":"예측",
+                            "error":"잔차","risk":"위험도","model":"모델(MoR)"
+                        })
+                        # 정렬·스타일 안전화: 일자 캐스팅 후 정렬
+                        if "일자" in tbl.columns:
+                            try:
+                                tbl["일자"] = pd.to_datetime(tbl["일자"], errors="coerce")
+                                tbl = tbl.sort_values(["계정","일자"])
+                            except Exception:
+                                tbl = tbl.sort_values(["계정"])  # 폴백
+                        st.subheader(title)
+                        fmt = {}
+                        for c in ["실측","예측","잔차"]:
+                            if c in tbl.columns: fmt[c] = "{:,.0f}"
+                        if "위험도" in tbl.columns: fmt["위험도"] = "{:.2f}"
+                        if "z" in tbl.columns: fmt["z"] = "{:.2f}"
+                        st.dataframe(tbl.style.format(fmt), use_container_width=True, height=300)
+                        st.download_button(
+                            "CSV 다운로드", data=tbl.to_csv(index=False).encode("utf-8-sig"),
+                            file_name=f"timeseries_summary_{'flow' if 'Flow' in title else 'balance'}.csv",
+                            mime="text/csv"
+                        )
 
-                            # UI: 공통 옵션 설정
-                            show_dividers = st.toggle("연/분기 구분선 표시", value=True, key=f"ts_dividers_toggle_{sel_acc}")
-                            pm_val_current = float(st.session_state.get("pm_value", PM_DEFAULT))
+                    _render_table(gathered_flow, "선택계정 요약 — 발생액(Flow)")
+                    _render_table(gathered_balance, "선택계정 요약 — 잔액(Balance)")
 
-                            # Helper to render figure and stats
-                            def _render_fig_and_stats(fig, stats, key_suffix):
-                                if fig and stats:
-                                    try:
-                                        diag = stats.get("diagnostics", {})
-                                        pval = diag.get("p_value")
-                                        b1, b2, b3 = st.columns(3)
-                                        b1.caption(f"계절성: {'강함' if diag.get('seasonality') else '약함'}")
-                                        ptxt = "" if pval is None or (isinstance(pval, float) and np.isnan(pval)) else f" (p={pval:.3f})"
-                                        b2.caption(f"정상성: {'확보' if diag.get('stationary') else '미확보'}" + ptxt)
-                                        b3.caption(f"데이터: {diag.get('n_months')}개월 — {'충분' if not diag.get('is_short') else '짧음'}")
-                                    except Exception:
-                                        pass
-                                    st.plotly_chart(fig, use_container_width=True, key=f"ts_line_{sel_acc}_{key_suffix}")
-                                    try:
-                                        meta = stats.get("metadata", {})
-                                        metrics = stats.get("metrics", {})
-                                        mae, mape = metrics.get('mae'), metrics.get('mape')
-                                        aic, bic = metrics.get('aic'), metrics.get('bic')
-                                        st.caption(
-                                            f"선택모델: **{meta.get('model')}** · 학습기간: {meta.get('data_span')} ({meta.get('train_months')}개월) · "
-                                            f"σ윈도우: {meta.get('sigma_window')}개월 · MAE: {mae:,.0f}원 · MAPE: {mape:.1f}% · "
-                                            f"AIC: {aic if isinstance(aic, float) and np.isfinite(aic) else '—'} · BIC: {bic if isinstance(bic, float) and np.isfinite(bic) else '—'}"
-                                        )
-                                        if meta.get('reasoning'):
-                                            st.info(meta.get('reasoning'))
-                                    except Exception:
-                                        pass
-                                    # 4. Detailed Stats Expander
-                                    with st.expander("이 차트의 통계 설정 보기", expanded=False):
-                                        st.write(stats.get("details"))
-                                elif stats and "error" in stats:
-                                    st.warning(stats["error"])
-                                else:
-                                    st.info("차트를 생성할 데이터가 부족합니다.")
+                    # ============ 🔎 시계열 파이프라인 진단(현황판) ============ #
+                    with st.expander("🔎 시계열 파이프라인 진단(현황판)", expanded=True):
+                        st.caption("각 단계별로 포인트 수/타입/정규화 상태를 집계합니다. 그래프가 안 뜨면 어디서 끊겼는지 여기서 확인하세요.")
+                        # 0) 원본 슬라이스 요약
+                        st.markdown("**0) 입력(원장 슬라이스) 요약**")
+                        try:
+                            st.write({
+                                "선택계정 수": len(want_codes),
+                                "원장 행수(선택계정)": int(len(ldf)),
+                                "date_col": date_col,
+                                "amount_col": amount_col,
+                                "date_dtype": str(ldf[date_col].dtype),
+                                "amount_dtype": str(ldf[amount_col].dtype),
+                                "NaT(날짜)": int(pd.to_datetime(ldf[date_col], errors="coerce").isna().sum()),
+                                "NaN(금액)": int(pd.to_numeric(ldf[amount_col], errors="coerce").isna().sum()),
+                                "기간": f"{pd.to_datetime(ldf[date_col], errors='coerce').min()} ~ {pd.to_datetime(ldf[date_col], errors='coerce').max()}",
+                            })
+                            st.dataframe(ldf[[date_col, "계정코드", "계정명", amount_col]].head(5), use_container_width=True)
+                        except Exception as _e:
+                            st.warning(f"입력 요약 실패: {_e}")
 
-                            if is_bs:
-                                pair = st.toggle("쌍차트 보기(Flow+Balance)", value=True)
-                                if pair:
-                                    c1, c2 = st.columns(2)
-                                    with c1:
-                                        f1, st1 = create_timeseries_figure(
-                                            cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
-                                            pm_value=pm_val_current,
-                                            show_dividers=show_dividers
-                                        )
-                                        _render_fig_and_stats(f1, st1, "flow")
-                                    with c2:
-                                        f2, st2 = create_timeseries_figure(
-                                            cur_hist, 'balance', f"{sel_acc} — Balance (actual vs MoR)",
-                                            pm_value=pm_val_current,
-                                            show_dividers=show_dividers
-                                        )
-                                        _render_fig_and_stats(f2, st2, "balance")
-                                else:
-                                    fig, stx = create_timeseries_figure(
-                                        cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
-                                        pm_value=pm_val_current,
-                                        show_dividers=show_dividers
-                                    )
-                                    _render_fig_and_stats(fig, stx, "flow_single")
-                            else:
-                                fig, stx = create_timeseries_figure(
-                                    cur_hist, 'flow', f"{sel_acc} — Flow (actual vs MoR)",
-                                    pm_value=pm_val_current,
-                                    show_dividers=show_dividers
+                        # 1) 계정×월 집계 확인
+                        st.markdown("**1) 월별 집계 상태**")
+                        try:
+                            _tmp = ldf[[date_col, amount_col]].copy()
+                            _tmp = _tmp.rename(columns={date_col: '회계일자', amount_col: '거래금액'})
+                            _grp = aggregate_monthly(_tmp, date_col='회계일자', amount_col='거래금액').rename(columns={"amount":"flow"})
+                            _grp["date"] = pd.to_datetime(_grp["date"], errors="coerce")
+                            _norm_ok = int((_grp["date"].dt.hour.eq(0) & _grp["date"].dt.minute.eq(0)).sum())
+                            st.write({
+                                "집계 포인트 수": int(len(_grp)),
+                                "월말 00:00:00 비율": f"{_norm_ok}/{len(_grp)}",
+                                "예: 첫 3행": None
+                            })
+                            st.dataframe(_grp.head(3), use_container_width=True)
+                        except Exception as _e:
+                            st.warning(f"월별 집계 상태 계산 실패: {_e}")
+
+                        # 2) 러너 결과 요약
+                        st.markdown("**2) 모델 입력/출력 상태(run_timeseries_minimal · EMA)**")
+                        if gathered_flow:
+                            try:
+                                _all = pd.concat(gathered_flow + gathered_balance, ignore_index=True)
+                                st.write({
+                                    "계정×기준(measure) 개수": int(_all[["계정","measure"]].drop_duplicates().shape[0]),
+                                    "actual 존재": bool("actual" in _all.columns),
+                                    "predicted 존재": bool("predicted" in _all.columns),
+                                    "flow 포인트": int(_all[_all["measure"].eq("flow")].shape[0]),
+                                    "balance 포인트": int(_all[_all["measure"].eq("balance")].shape[0] if "measure" in _all.columns else 0),
+                                })
+                                st.dataframe(_all.head(5), use_container_width=True)
+                            except Exception as _e:
+                                st.warning(f"러너 출력 요약 실패: {_e}")
+                        else:
+                            st.warning("러너 출력(gathered_*)가 비어 있습니다. 상단 입력/집계 단계 확인 필요.")
+
+                        # 3) 그림 입력 전 점검(계정별)
+                        st.markdown("**3) 그림 입력 사전 점검(create_timeseries_figure 직전)**")
+                        try:
+                            for acc_name, df_all in results_per_account.items():
+                                for ms in (["flow","balance"] if df_all["measure"].eq("balance").any() else ["flow"]):
+                                    dfx = df_all[df_all["measure"].eq(ms)]
+                                    st.write(f"- {acc_name} / {ms}: N={len(dfx)} · 컬럼={list(dfx.columns)} · 날짜범위={pd.to_datetime(dfx['date']).min()}~{pd.to_datetime(dfx['date']).max()}")
+                                    st.dataframe(dfx[["date","actual","predicted"]].head(3), use_container_width=True)
+                        except Exception as _e:
+                            st.warning(f"그림 입력 점검 실패: {_e}")
+
+                    # === 그래프 렌더(아래): 계정별로 표시 ===
+                    for acc_name, df_all in results_per_account.items():
+                        for measure in (["flow","balance"] if (df_all["measure"].eq("balance").any()) else ["flow"]):
+                            dfm = df_all[df_all["measure"]==measure].rename(columns={"account":"계정"}).copy()
+                            dfm["date"] = pd.to_datetime(dfm["date"], errors="coerce")
+                            dfm = dfm.sort_values("date").reset_index(drop=True)
+                            title = f"{acc_name} — {'발생액(Flow)' if measure=='flow' else '잔액(Balance)'}"
+                            fig, stats = create_timeseries_figure(dfm, measure=measure, title=title,
+                                                                  pm_value=PM, show_dividers=False)
+                            st.subheader(title)
+                            if fig is not None:
+                                st.plotly_chart(fig, use_container_width=True)
+                            if stats:
+                                st.caption(
+                                    f"모형:{dfm.get('model','').iloc[-1] if not dfm.empty else '-'} · "
+                                    f"정상성:{stats.get('diagnostics',{}).get('stationary')} · "
+                                    f"계절성:{stats.get('diagnostics',{}).get('seasonality')} · "
+                                    f"표본월:{stats.get('diagnostics',{}).get('n_months')}"
                                 )
-                                _render_fig_and_stats(fig, stx, "flow_only")
-
-                        # (삭제됨) 막대 대조 UI — 오류 원인 경로 차단
-
-                    else:
-                        st.info("예측을 표시할 충분한 월별 데이터가 없습니다.")
                 # ⚠️ 기존 tab5(위험평가) 블록 전체 삭제됨
                 
+                with tab_corr_adv:
+                    st.header("상관관계(고급)")
+                    lf_adv = st.session_state.get('lf_focus') or st.session_state.get('lf_hist')
+                    if lf_adv is None:
+                        st.info("원장을 먼저 업로드해 주세요.")
+                    else:
+                        mdf_adv = st.session_state.master_df
+                        acct_names_adv = sorted(mdf_adv['계정명'].dropna().astype(str).unique().tolist())
+                        colA, colB = st.columns(2)
+                        with colA:
+                            picked_accounts_adv = st.multiselect("분석 계정(다중 선택)", options=acct_names_adv, key="corr_adv_accounts")
+                        with colB:
+                            picked_cycles_adv = st.multiselect("사이클 프리셋(선택 시 계정 자동 반영)", options=list(cyc.CYCLE_KO.values()), key="corr_adv_cycles")
+                            if st.button("프리셋 적용", key="btn_apply_preset_corr_adv"):
+                                mapping = cyc.get_effective_cycles(getattr(uploaded_file, 'name', '_default'))
+                                codes = cyc.accounts_for_cycles_ko(mapping, picked_cycles_adv)
+                                code_to_name = (
+                                    mdf_adv[['계정코드','계정명']].assign(계정코드=lambda d: d['계정코드'].astype(str)).drop_duplicates()
+                                        .set_index('계정코드')['계정명'].astype(str).to_dict()
+                                )
+                                cur_set = set(st.session_state.get("corr_adv_accounts", []))
+                                cur_set.update({code_to_name.get(c, c) for c in codes})
+                                st.session_state["corr_adv_accounts"] = sorted(cur_set)
+
+                        method = st.selectbox("상관 방식", ["pearson", "spearman", "kendall"], index=0, key="corr_adv_method")
+                        corr_threshold = st.slider("임계치(|r|)", 0.1, 0.95, 0.70, 0.05, key="corr_adv_thr")
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            max_lag = st.slider("최대 시차(개월)", 0, 12, 6, 1, key="corr_adv_maxlag")
+                        with c2:
+                            rolling_window = st.slider("롤링 윈도우(개월)", 3, 24, 6, 1, key="corr_adv_rollwin")
+
+                        if st.button("분석 실행", key="run_corr_adv"):
+                            try:
+                                from analysis.corr_advanced import run_corr_advanced as run_corr_adv
+                                mr = run_corr_adv(
+                                    lf_adv,
+                                    st.session_state.get("corr_adv_accounts", picked_accounts_adv) or [],
+                                    method=st.session_state.get("corr_adv_method", "pearson"),
+                                    corr_threshold=float(st.session_state.get("corr_adv_thr", 0.70)),
+                                    max_lag=int(st.session_state.get("corr_adv_maxlag", 6)),
+                                    rolling_window=int(st.session_state.get("corr_adv_rollwin", 6)),
+                                )
+                                st.subheader("히트맵")
+                                if "heatmap" in mr.figures:
+                                    st.plotly_chart(mr.figures["heatmap"], use_container_width=True)
+                                if "strong_pairs" in mr.tables:
+                                    st.subheader("임계치 이상 상관쌍")
+                                    st.dataframe(mr.tables["strong_pairs"], use_container_width=True)
+                                if "lagged_pairs" in mr.tables:
+                                    st.subheader("최적 시차 상관(Top)")
+                                    st.dataframe(mr.tables["lagged_pairs"], use_container_width=True)
+                                if "rolling_stability" in mr.tables:
+                                    st.subheader("롤링 안정성(변동성 낮은 순)")
+                                    st.dataframe(mr.tables["rolling_stability"], use_container_width=True)
+                            except Exception as _e:
+                                st.warning(f"고급 상관 분석 실패: {_e}")
                 with tab_report:
                     st.header("🧠 분석 종합 대시보드")
                     # --- Preview: modules session quick view ---
@@ -1285,7 +1472,7 @@ if uploaded_file is not None:
                                     if len(pick_codes) >= 2:
                                         _push_module(run_correlation_module(lf_use, accounts=pick_codes,
                                                                             corr_threshold=0.70,
-                                                                            cycles_map=get_effective_cycles()))
+                                                                            cycles_map=cyc.get_effective_cycles()))
                                 except Exception as _e:
                                     st.warning(f"correlation 모듈 실패: {_e}")
                                 # 정합성(ModuleResult) — 선택 계정 필터 적용
@@ -1297,7 +1484,7 @@ if uploaded_file is not None:
                                 try:
                                     if not df_cy.empty:
                                         ts = pd.concat([df_cy, df_py], ignore_index=True)
-                                        ts["date"] = pd.to_datetime(ts["회계일자"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+                                        ts["date"] = month_end_00(ts["회계일자"])  # 월말 00:00:00 정규화
                                         ts["account"] = ts["계정코드"].astype(str)
                                         ts["amount"] = ts.get("발생액", 0.0).astype(float)
                                         ts_in = ts.groupby(["account","date"], as_index=False)["amount"].sum()

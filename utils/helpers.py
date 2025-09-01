@@ -78,3 +78,28 @@ def model_reason_text(name: str, d: dict) -> str:
         return " / ".join(why)
     except Exception:
         return "오차지표(MAE/MAPE)와 정보량(AIC/BIC)을 종합해 최적 모델로 선택되었습니다."
+
+
+# --- NEW: 시계열용 날짜/금액 컬럼 자동 탐색 ---
+def guess_time_and_amount_cols(df: pd.DataFrame):
+    """시계열용 날짜/금액 컬럼을 유연하게 탐색한다."""
+    date_candidates = ["회계일자", "전표일자", "거래일자", "일자", "date", "Date"]
+    amt_candidates  = [
+        "거래금액", "발생액", "금액", "금액(원)", "거래금액_절대값",
+        "발생액_절대값", "순액", "순액(원)"
+    ]
+    cols = list(df.columns) if df is not None else []
+    date_col = next((c for c in date_candidates if c in cols), None)
+    amt_col  = next((c for c in amt_candidates  if c in cols), None)
+    return date_col, amt_col
+
+
+# --- NEW: 공용 add_or_replace (df.insert 대체) ---
+def add_or_replace(df: pd.DataFrame, loc: int, col: str, values):
+    """df.insert 대체: 이미 있으면 교체, 없으면 지정 위치에 추가."""
+    import pandas as pd
+    if col in df.columns:
+        df[col] = values
+        return df
+    df.insert(loc, col, values)
+    return df

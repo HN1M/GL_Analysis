@@ -94,20 +94,62 @@ def run_correlation_module(
         return ModuleResult("correlation", {}, {"excluded_accounts": excluded}, {}, [], [warn])
 
     corr = piv_f.T.corr(method='pearson')  # 계정×계정
-    fig = px.imshow(corr, text_auto=False, title="계정 간 월별 상관 히트맵", labels=dict(x="계정코드", y="계정코드", color="상관계수"), aspect='auto')
+    # 계정코드 → 계정명 매핑
+    try:
+        name_map = (
+            df.drop_duplicates('계정코드')
+              .assign(계정코드=lambda d: d['계정코드'].astype(str))
+              .set_index('계정코드')['계정명']
+              .astype(str).to_dict()
+        )
+    except Exception:
+        name_map = {}
+    xn = [name_map.get(str(c), str(c)) for c in corr.columns]
+    yn = [name_map.get(str(r), str(r)) for r in corr.index]
+    fig = px.imshow(
+        corr,
+        text_auto=False,
+        title="계정 간 월별 상관 히트맵",
+        labels=dict(x="계정", y="계정", color="상관계수"),
+        aspect='auto',
+        x=xn,
+        y=yn,
+    )
+    fig.update_traces(hovertemplate="계정: %{y} × %{x}<br>상관계수: %{z:.3f}<extra></extra>")
     fig.update_coloraxes(cmin=-1, cmax=1)
     fig.update_xaxes(type='category')
     fig.update_yaxes(type='category')
 
-    # 임계 상관쌍 테이블
-    pairs: List[Tuple[str,str,float]] = []
-    idx = corr.index.astype(str).tolist()
-    for i in range(len(idx)):
-        for j in range(i+1, len(idx)):
-            r = float(corr.iloc[i, j])
-            if abs(r) >= corr_threshold:
-                pairs.append((idx[i], idx[j], r))
-    pairs_df = pd.DataFrame(pairs, columns=['계정코드_A','계정코드_B','상관계수']).sort_values('상관계수', ascending=False)
+    # 임계 상관쌍 테이블 (idempotent-safe)
+    def build_strong_pairs(corr_matrix: pd.DataFrame, code_to_name: dict, threshold: float = 0.7) -> pd.DataFrame:
+        import numpy as _np
+        import pandas as _pd
+        mask = _np.triu(_np.ones_like(corr_matrix, dtype=bool), k=1)
+        cm = corr_matrix.copy().mask(mask)
+        rows = []
+        abs_vals = cm.abs().values
+        idx_i, idx_j = _np.where(abs_vals >= threshold)
+        for i, j in zip(idx_i, idx_j):
+            rows.append({
+                "계정코드_A": corr_matrix.index[i],
+                "계정코드_B": corr_matrix.columns[j],
+                "상관계수": float(cm.values[i, j]),
+            })
+        pairs_df = _pd.DataFrame(rows)
+        if pairs_df.empty:
+            return pairs_df
+        pairs_df = pairs_df.assign(
+            계정명_A=pairs_df["계정코드_A"].map(code_to_name),
+            계정명_B=pairs_df["계정코드_B"].map(code_to_name),
+        )
+        base_cols = ["계정명_A", "계정코드_A", "계정명_B", "계정코드_B", "상관계수"]
+        pairs_df = pairs_df[base_cols]
+        pairs_df = pairs_df.reindex(
+            pairs_df["상관계수"].abs().sort_values(ascending=False).index
+        )
+        return pairs_df
+
+    pairs_df = build_strong_pairs(corr, name_map, threshold=float(corr_threshold))
 
     # 사이클 매핑 요약(계정명 필요하므로 별도 표에서는 계정명 매핑 필요 시 upstream에서 처리)
     summary = {
