@@ -46,14 +46,15 @@ from analysis.embedding import (
     unify_cluster_names_with_llm,
 )
 from analysis.anomaly import calculate_grouped_stats_and_zscore
-from services.llm import LLMClient
+from services.llm import LLMClient, openai_available
 from services.cache import get_or_embed_texts
 import services.cycles_store as cyc
 from config import EMB_USE_LARGE_DEFAULT, HDBSCAN_RESCUE_TAU, EMB_MODEL_SMALL
 try:
-    from config import PM_DEFAULT
+    from config import PM_DEFAULT, IFOREST_CONTAM_DEFAULT
 except Exception:
     PM_DEFAULT = 500_000_000
+    IFOREST_CONTAM_DEFAULT = 0.03
 from utils.viz import add_materiality_threshold, add_pm_badge
 from services.cluster_naming import (
     make_synonym_confirm_fn,
@@ -482,6 +483,13 @@ def _lf_by_scope() -> LedgerFrame:
     hist = st.session_state.get('lf_hist')
     scope = st.session_state.get('period_scope', '당기')
     if hist is None:
+        # ✅ 업로드/매핑만 끝나도 동작하도록 폴백 구성
+        df_ledger = st.session_state.get("ledger_df")
+        df_master = st.session_state.get("master_df")
+        if df_ledger is not None and not getattr(df_ledger, 'empty', True):
+            hist = LedgerFrame(df=df_ledger, meta={"master_df": df_master})
+            st.session_state.lf_hist = hist
+    if hist is None:
         return None
     return LedgerFrame(df=_apply_scope(hist.df, scope), meta=hist.meta)
 
@@ -699,7 +707,7 @@ if uploaded_file is not None:
                         if df is None or df.empty:
                             st.info("검증할 데이터가 없습니다.")
                             return
-                        
+
                         # 1) '차이'를 안전하게 수치화
                         if "차이" in df.columns:
                             diff = pd.to_numeric(df["차이"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
@@ -872,27 +880,79 @@ if uploaded_file is not None:
 
                 with tab_anomaly:
                     st.header("이상 패턴 탐지")
+                    st.caption("z-점수 외에도 임베딩 기반 의미분석과 Isolation Forest를 선택해 다각도로 탐지할 수 있습니다.")
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     mdf = st.session_state.master_df
                     acct_names = mdf['계정명'].unique()
                     pick = st.multiselect("대상 계정 선택(미선택 시 자동 추천)", acct_names, default=[])
-                    topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=500, value=20, step=10)
+                    topn = st.slider("표시 개수(상위 |Z|)", min_value=10, max_value=200, value=20, step=5)
+
+                    # --- NEW: 탐지 옵션 ---
+                    opt1, opt2, opt3 = st.columns(3)
+                    with opt1:
+                        use_semantic = st.checkbox("임베딩 의미분석", value=True, help="OpenAI 키 필요. 적요/거래처 문장의 의미적 이탈을 포착합니다.")
+                    with opt2:
+                        use_subcluster = st.checkbox("하위클러스터링", value=False, help="계정 내 유사 거래를 묶어 그룹별 이탈을 봅니다.")
+                    with opt3:
+                        use_iforest = st.checkbox("Isolation Forest", value=True, help="수치 특징(금액·|Z| 등)으로 비감독 이상치 탐지.")
+                    contam = st.slider("IForest contamination(이상 비율)", 0.01, 0.15, float(IFOREST_CONTAM_DEFAULT), 0.01, disabled=not use_iforest)
+
                     if st.button("이상치 분석 실행"):
                         lf_use = _lf_by_scope()
                         codes = None
                         if pick:
                             codes = mdf[mdf['계정명'].isin(pick)]['계정코드'].astype(str).tolist()
-                        amod = run_anomaly_module(lf_use, target_accounts=codes, topn=topn, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
+                        # --- NEW: 임베딩 주입 준비(analysis 레이어는 services 직접 의존 금지 → UI에서 주입) ---
+                        embed_client = None
+                        embed_texts_fn = None
+                        if use_semantic:
+                            try:
+                                if openai_available():
+                                    embed_client = LLMClient().client
+                                    embed_texts_fn = get_or_embed_texts
+                                else:
+                                    st.info("🔌 OpenAI Key가 없어 의미분석은 비활성화됩니다.")
+                            except Exception as e:
+                                st.info(f"의미분석 준비 실패: {e}")
+
+                        amod = run_anomaly_module(
+                            lf_use,
+                            target_accounts=codes,
+                            topn=topn,
+                            pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)),
+                            # --- NEW: injection knobs ---
+                            embed_client=embed_client,
+                            embed_texts_fn=embed_texts_fn,
+                            use_large_embedding=bool(st.session_state.get('use_large_embedding', False)),
+                            semantic_enabled=bool(use_semantic),
+                            subcluster_enabled=bool(use_subcluster),
+                            iforest_enabled=bool(use_iforest),
+                            iforest_contamination=float(contam) if use_iforest else None,
+                        )
                         _push_module(amod)
                         for w in amod.warnings: st.warning(w)
                         if 'anomaly_top' in amod.tables:
                             _tbl = amod.tables['anomaly_top'].copy()
                             fmt = {}
                             if '발생액' in _tbl.columns: fmt['발생액'] = '{:,.0f}'
-                            if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:.2f}'
+                            if 'Z-Score' in _tbl.columns: fmt['Z-Score'] = '{:+.2f}'
+                            if 'semantic_z' in _tbl.columns: fmt['semantic_z'] = '{:+.2f}'
+                            if 'iforest_score' in _tbl.columns: fmt['iforest_score'] = '{:.2f}'
                             st.dataframe(_tbl.style.format(fmt), use_container_width=True)
                         if 'zscore_hist' in amod.figures:
                             st.plotly_chart(amod.figures['zscore_hist'], use_container_width=True, key="anomaly_hist")
+                        if 'semantic_hist' in amod.figures:
+                            st.plotly_chart(amod.figures['semantic_hist'], use_container_width=True)
+                        if 'iforest_hist' in amod.figures:
+                            st.plotly_chart(amod.figures['iforest_hist'], use_container_width=True)
+
+                        # --- NEW: 신호별 상위 테이블 ---
+                        if 'semantic_top' in amod.tables:
+                            st.subheader("의미 기반 이상(semantic_z) Top")
+                            st.dataframe(amod.tables['semantic_top'].style.format(fmt), use_container_width=True)
+                        if 'iforest_top' in amod.tables:
+                            st.subheader("Isolation Forest Top")
+                            st.dataframe(amod.tables['iforest_top'].style.format(fmt), use_container_width=True)
 
                 with tab_ts:
                     st.header("시계열 예측")
@@ -1296,7 +1356,7 @@ if uploaded_file is not None:
                         rows = []
                         for acc_name, df in (results_per_account or {}).items():
                             if df is None or df.empty or "z" not in df.columns:
-                                continue
+                                    continue
                             dfx = df.copy()
                             # 계정명 보강 (혹시 누락 대비)
                             if "계정" not in dfx.columns:
@@ -1620,11 +1680,15 @@ if uploaded_file is not None:
                                                 except Exception:
                                                     st.write("- (표시 실패)")
                                         if getattr(mr, 'tables', None):
-                                            try: st.caption(f"tables: {list(mr.tables.keys())}")
-                                            except Exception: pass
+                                            try:
+                                                st.caption(f"tables: {list(mr.tables.keys())}")
+                                            except Exception:
+                                                pass
                                         if getattr(mr, 'figures', None):
-                                            try: st.caption(f"figures: {list(mr.figures.keys())}")
-                                            except Exception: pass
+                                            try:
+                                                st.caption(f"figures: {list(mr.figures.keys())}")
+                                            except Exception:
+                                                pass
                                     except Exception:
                                         st.caption("(미리보기 실패)")
                     # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능

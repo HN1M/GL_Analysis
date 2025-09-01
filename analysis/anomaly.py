@@ -311,6 +311,24 @@ def run_anomaly_module(
               .head(int(topn)))
     table = cand[out_cols + (['is_outlier'] if 'is_outlier' in cand.columns and 'is_outlier' not in out_cols else [])] if out_cols else cand
 
+    # (NEW) 신호별 상위 테이블
+    tables = {"anomaly_top": table}
+    try:
+        if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
+            sem_top = (df.assign(_abs_sem=df['semantic_z'].abs())
+                         .sort_values('_abs_sem', ascending=False)
+                         .drop(columns=['_abs_sem'])
+                         .head(int(topn)))
+            tables["semantic_top"] = sem_top[[c for c in out_cols if c in sem_top.columns]]
+    except Exception:
+        pass
+    try:
+        if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
+            if_top = df.sort_values('iforest_score', ascending=False).head(int(topn))
+            tables["iforest_top"] = if_top[[c for c in out_cols if c in if_top.columns]]
+    except Exception:
+        pass
+
     # === EvidenceDetail 생성 (KIT + |Z| 기준) ===
     pm = float(pm_value) if pm_value is not None else float(PM_DEFAULT)
     ev_rows: List[EvidenceDetail] = []
@@ -371,7 +389,26 @@ def run_anomaly_module(
         fig = px.bar(dist_df, x='구간', y='건수', title=title)
         fig.update_yaxes(separatethousands=True)
         fig.update_layout(bargap=0.10)
-        figures = {"zscore_hist": fig}
+        figures["zscore_hist"] = fig
+    except Exception:
+        pass
+    # (NEW) semantic_z / iforest_score 히스토그램
+    try:
+        if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
+            s = pd.to_numeric(df['semantic_z'], errors='coerce').dropna()
+            bins = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
+            cats = pd.cut(s, bins=bins, right=False)
+            sem_hist = cats.value_counts().sort_index().reset_index()
+            sem_hist.columns = ['구간','건수']
+            figures["semantic_hist"] = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+    except Exception:
+        pass
+    try:
+        if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
+            sc = pd.to_numeric(df['iforest_score'], errors='coerce').dropna()
+            if_hist = pd.cut(sc, bins=[x/20 for x in range(0,21)], right=False).value_counts().sort_index().reset_index()
+            if_hist.columns = ['구간','건수']
+            figures["iforest_hist"] = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
     except Exception:
         pass
 
@@ -399,7 +436,7 @@ def run_anomaly_module(
     return ModuleResult(
         name="anomaly",
         summary=summary,
-        tables={"anomaly_top": table, **({"evidence_preview": ev_tbl} if ev_tbl is not None else {})},
+        tables={**tables, **({"evidence_preview": ev_tbl} if ev_tbl is not None else {})},
         figures=figures,
         evidences=ev_rows,
         warnings=[]

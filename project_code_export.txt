@@ -487,6 +487,13 @@ def _lf_by_scope() -> LedgerFrame:
     hist = st.session_state.get('lf_hist')
     scope = st.session_state.get('period_scope', '당기')
     if hist is None:
+        # ✅ 업로드/매핑만 끝나도 동작하도록 폴백 구성
+        df_ledger = st.session_state.get("ledger_df")
+        df_master = st.session_state.get("master_df")
+        if df_ledger is not None and not getattr(df_ledger, 'empty', True):
+            hist = LedgerFrame(df=df_ledger, meta={"master_df": df_master})
+            st.session_state.lf_hist = hist
+    if hist is None:
         return None
     return LedgerFrame(df=_apply_scope(hist.df, scope), meta=hist.meta)
 
@@ -704,7 +711,7 @@ if uploaded_file is not None:
                         if df is None or df.empty:
                             st.info("검증할 데이터가 없습니다.")
                             return
-                        
+
                         # 1) '차이'를 안전하게 수치화
                         if "차이" in df.columns:
                             diff = pd.to_numeric(df["차이"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
@@ -935,7 +942,7 @@ if uploaded_file is not None:
                     master_df: pd.DataFrame = st.session_state.get("master_df", pd.DataFrame())
                     if master_df.empty:
                         st.info("원장 데이터가 없습니다.")
-                        st.stop()
+                        # st.stop() 제거하여 뒤 탭 렌더 차단 방지
 
                     # --- state bootstrap --- (위젯 생성 전에 실행)
                     st.session_state.setdefault("ts_accounts_names", [])
@@ -1301,7 +1308,7 @@ if uploaded_file is not None:
                         rows = []
                         for acc_name, df in (results_per_account or {}).items():
                             if df is None or df.empty or "z" not in df.columns:
-                                continue
+                                    continue
                             dfx = df.copy()
                             # 계정명 보강 (혹시 누락 대비)
                             if "계정" not in dfx.columns:
@@ -1625,11 +1632,15 @@ if uploaded_file is not None:
                                                 except Exception:
                                                     st.write("- (표시 실패)")
                                         if getattr(mr, 'tables', None):
-                                            try: st.caption(f"tables: {list(mr.tables.keys())}")
-                                            except Exception: pass
+                                            try:
+                                                st.caption(f"tables: {list(mr.tables.keys())}")
+                                            except Exception:
+                                                pass
                                         if getattr(mr, 'figures', None):
-                                            try: st.caption(f"figures: {list(mr.figures.keys())}")
-                                            except Exception: pass
+                                            try:
+                                                st.caption(f"figures: {list(mr.figures.keys())}")
+                                            except Exception:
+                                                pass
                                     except Exception:
                                         st.caption("(미리보기 실패)")
                     # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능
@@ -2631,6 +2642,24 @@ def run_anomaly_module(
               .head(int(topn)))
     table = cand[out_cols + (['is_outlier'] if 'is_outlier' in cand.columns and 'is_outlier' not in out_cols else [])] if out_cols else cand
 
+    # (NEW) 신호별 상위 테이블
+    tables = {"anomaly_top": table}
+    try:
+        if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
+            sem_top = (df.assign(_abs_sem=df['semantic_z'].abs())
+                         .sort_values('_abs_sem', ascending=False)
+                         .drop(columns=['_abs_sem'])
+                         .head(int(topn)))
+            tables["semantic_top"] = sem_top[[c for c in out_cols if c in sem_top.columns]]
+    except Exception:
+        pass
+    try:
+        if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
+            if_top = df.sort_values('iforest_score', ascending=False).head(int(topn))
+            tables["iforest_top"] = if_top[[c for c in out_cols if c in if_top.columns]]
+    except Exception:
+        pass
+
     # === EvidenceDetail 생성 (KIT + |Z| 기준) ===
     pm = float(pm_value) if pm_value is not None else float(PM_DEFAULT)
     ev_rows: List[EvidenceDetail] = []
@@ -2691,7 +2720,26 @@ def run_anomaly_module(
         fig = px.bar(dist_df, x='구간', y='건수', title=title)
         fig.update_yaxes(separatethousands=True)
         fig.update_layout(bargap=0.10)
-        figures = {"zscore_hist": fig}
+        figures["zscore_hist"] = fig
+    except Exception:
+        pass
+    # (NEW) semantic_z / iforest_score 히스토그램
+    try:
+        if 'semantic_z' in df.columns and df['semantic_z'].notna().any():
+            s = pd.to_numeric(df['semantic_z'], errors='coerce').dropna()
+            bins = [-np.inf] + [x for x in np.arange(-3.0, 3.25, 0.25)] + [np.inf]
+            cats = pd.cut(s, bins=bins, right=False)
+            sem_hist = cats.value_counts().sort_index().reset_index()
+            sem_hist.columns = ['구간','건수']
+            figures["semantic_hist"] = px.bar(sem_hist, x='구간', y='건수', title="Semantic Z 분포(0.25σ bin)")
+    except Exception:
+        pass
+    try:
+        if 'iforest_score' in df.columns and df['iforest_score'].notna().any():
+            sc = pd.to_numeric(df['iforest_score'], errors='coerce').dropna()
+            if_hist = pd.cut(sc, bins=[x/20 for x in range(0,21)], right=False).value_counts().sort_index().reset_index()
+            if_hist.columns = ['구간','건수']
+            figures["iforest_hist"] = px.bar(if_hist, x='구간', y='건수', title="Isolation Forest 점수 분포([0,1])")
     except Exception:
         pass
 
@@ -2719,7 +2767,7 @@ def run_anomaly_module(
     return ModuleResult(
         name="anomaly",
         summary=summary,
-        tables={"anomaly_top": table, **({"evidence_preview": ev_tbl} if ev_tbl is not None else {})},
+        tables={**tables, **({"evidence_preview": ev_tbl} if ev_tbl is not None else {})},
         figures=figures,
         evidences=ev_rows,
         warnings=[]
@@ -3356,17 +3404,22 @@ def run_corr_advanced(
     # 롤링 안정성(낮은 변동성 우선)
     roll = pd.DataFrame(_rolling_stability(pivot, int(rolling_window)))
 
-    # Evidence 샘플
+    # Evidence 샘플(상위 10개): |r|을 anomaly_score로 활용
     evid: List[EvidenceDetail] = []
+    # 각 계정의 월별 절대발생액 합(규모) → 증거의 재무영향 추정치로 사용
+    size_by_acct = pivot.abs().sum(axis=0).astype(float).to_dict()
     for row in strong[: min(10, len(strong))]:
+        a, b = str(row["계정A"]), str(row["계정B"])
+        r = float(row["상관계수"])
         evid.append(EvidenceDetail(
-            row_id=f"{row['계정A']}|{row['계정B']}",
-            reason=f"corr={row['상관계수']:+.2f} (|r|≥{corr_threshold})",
-            risk_score=min(1.0, abs(float(row["상관계수"]))),
-            financial_impact=0.0,
+            row_id=f"{a}|{b}",
+            reason=f"corr={r:+.2f} (|r|≥{corr_threshold})",
+            anomaly_score=abs(r),
+            financial_impact=float(min(size_by_acct.get(a, 0.0), size_by_acct.get(b, 0.0))),
+            risk_score=abs(r),
             is_key_item=False,
             impacted_assertions=[],
-            links={"account_a": row["계정A"], "account_b": row["계정B"], "type": "corr_strong"},
+            links={"account_a": a, "account_b": b, "type": "corr_strong"},
         ))
 
     summary = {
