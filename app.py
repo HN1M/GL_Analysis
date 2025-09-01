@@ -233,6 +233,19 @@ def _apply_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
         return df[df['period_tag'].isin(['CY', 'PY'])]
     return df
 
+# === 공용: 표 높이 자동 제한(행 수 기반) ===
+def _auto_table_height(df, max_rows: int = 10, row_px: int = 36, header_px: int = 42) -> int:
+    """
+    df 길이에 맞춰 높이를 계산. 최대 max_rows까지만 보이고, 넘치면 스크롤.
+    - row_px는 테마에 따라 34~40px 정도가 자연스러움.
+    """
+    try:
+        n = int(len(df))
+    except Exception:
+        n = max_rows
+    visible = min(max(n, 1), max_rows)  # 최소 1행은 보이게
+    return int(visible * row_px + header_px)
+
 def _lf_by_scope() -> LedgerFrame:
     """상관/거래처/이상치에서 사용할 스코프 적용 LedgerFrame."""
     hist = st.session_state.get('lf_hist')
@@ -1138,6 +1151,14 @@ if uploaded_file is not None:
                                 "예: 첫 3행": None
                             })
                             st.dataframe(_grp.head(3), use_container_width=True)
+                            # (보너스) 경계선 예상 개수
+                            try:
+                                rng = pd.date_range(pd.to_datetime(ldf[date_col]).min(), pd.to_datetime(ldf[date_col]).max(), freq="M")
+                                q_ends = [m for m in rng if m.month in (3,6,9,12)]
+                                y_ends = [m for m in rng if m.month == 12]
+                                st.write({"경계선(분기말) 예상 개수": len(q_ends), "경계선(연말) 예상 개수": len(y_ends)})
+                            except Exception as _ee:
+                                st.info(f"경계선 개수 계산 실패: {_ee}")
                         except Exception as _e:
                             st.warning(f"월별 집계 상태 계산 실패: {_e}")
 
@@ -1165,6 +1186,21 @@ if uploaded_file is not None:
                                     st.dataframe(_all.head(5), use_container_width=True)
                         except Exception as _e:
                             st.warning(f"러너 출력 요약 실패: {type(_e).__name__}: {_e}")
+
+                        # 부호 보정 가드 표시
+                        st.markdown("**부호 보정 가드**")
+                        try:
+                            pipeline_norm = any(c in ldf.columns for c in ["발생액_norm", "amount_norm", "__sign", "sign"])
+                            plot_sign_flip = False  # 플롯 레벨 반전은 하지 않음
+                            st.write({
+                                "pipeline_norm": bool(pipeline_norm),
+                                "plot_sign_flip": bool(plot_sign_flip),
+                                "guard_ok": bool(pipeline_norm and not plot_sign_flip)
+                            })
+                            if pipeline_norm and plot_sign_flip:
+                                st.warning("경고: 파이프라인과 플롯에서 모두 부호를 만지면 이중 반전 위험이 있습니다.")
+                        except Exception as _e:
+                            st.info(f"부호 보정 가드 점검 실패: {_e}")
 
                         # 3) 그림 입력 전 점검(계정별)
                         st.markdown("**3) 그림 입력 사전 점검(create_timeseries_figure 직전)**")
