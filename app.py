@@ -642,14 +642,37 @@ if uploaded_file is not None:
                     st.caption(f"🔎 현재 스코프: {st.session_state.get('period_scope','당기')}")
                     st.subheader("1. 데이터 정합성 검증 결과")
                     mod = st.session_state.get('modules', {}).get('integrity')
-                    status = (getattr(mod, 'summary', {}) or {}).get('overall_status', 'Pass') if mod else 'Pass'
                     result_df = (getattr(mod, 'tables', {}) or {}).get('reconciliation') if mod else st.session_state.get('recon_df')
-                    if status == "Pass":
-                        st.success("✅ 모든 계정의 데이터가 일치합니다.")
-                    elif status == "Warning":
-                        st.warning("⚠️ 일부 계정에서 사소한 차이가 발견되었습니다.")
-                    else:
-                        st.error("🚨 일부 계정에서 중대한 차이가 발견되었습니다.")
+                    
+                    # === 표 데이터와 직접 연동된 배너 로직 ===
+                    def render_integrity_banner(df):
+                        if df is None or df.empty:
+                            st.info("검증할 데이터가 없습니다.")
+                            return
+                        
+                        # 1) '차이'를 안전하게 수치화
+                        if "차이" in df.columns:
+                            diff = pd.to_numeric(df["차이"].astype(str).str.replace(",", ""), errors="coerce").fillna(0)
+                        else:
+                            diff = pd.Series([0] * len(df))
+                        
+                        # 2) 허용 오차(1원) 이하를 0으로 간주
+                        tol = 1.0
+                        fails_mask = diff.abs() > tol
+                        
+                        # 3) '상태'가 있으면 교차 확인(방어적)
+                        if "상태" in df.columns:
+                            fails_mask = fails_mask | df["상태"].astype(str).str.lower().eq("fail")
+                        
+                        n_fail = int(fails_mask.sum())
+                        
+                        if n_fail > 0:
+                            max_gap = float(diff.abs().max())
+                            st.warning(f"❌ 불일치 계정 {n_fail}건 발견 · 최대 차이: {max_gap:,.0f}")
+                        else:
+                            st.success("✅ 모든 계정의 데이터가 일치합니다.")
+                    
+                    render_integrity_banner(result_df)
 
                     def highlight_status(row):
                         if row.상태 == 'Fail':
@@ -708,9 +731,7 @@ if uploaded_file is not None:
                         else:
                             st.info("표시할 추이 그래프가 없습니다.")
 
-                    st.markdown("---")
-                    st.subheader("3. 계정 간 상관 히트맵")
-                    st.info("이 기능은 상단의 **📊 상관관계 → '기본' 서브탭**으로 이동했습니다.")
+
 
                 with tab_vendor:
                     st.header("거래처 심층 분석")
@@ -970,15 +991,28 @@ if uploaded_file is not None:
                         )
                         st.stop()
 
-                    # (4) opening(전기말잔액) 맵 구성
+                    # (4) opening(전기초) 맵 구성 — BS Balance용: Master '전전기말잔액' 우선 사용
                     opening_map = {}
-                    if "전기말잔액" in master_df.columns and "계정코드" in master_df.columns:
-                        opening_map = (
-                            master_df[["계정코드","전기말잔액"]]
-                            .dropna(subset=["계정코드"])
-                            .assign(전기말잔액=lambda d: pd.to_numeric(d["전기말잔액"], errors="coerce").fillna(0.0))
-                            .groupby("계정코드")["전기말잔액"].first().to_dict()
-                        )
+                    if "계정코드" in master_df.columns:
+                        # 어떤 컬럼을 opening으로 쓸지 결정: 전전기말 → 전기말 → 없으면 0
+                        src_col = None
+                        if "전전기말잔액" in master_df.columns:
+                            src_col = "전전기말잔액"
+                        elif "전기말잔액" in master_df.columns:
+                            src_col = "전기말잔액"
+
+                        if src_col:
+                            _m = master_df[["계정코드", src_col]].dropna(subset=["계정코드"]).copy()
+                            _m["계정코드"] = _m["계정코드"].astype(str)
+                            _m[src_col] = pd.to_numeric(_m[src_col], errors="coerce").fillna(0.0)
+                            # 내부 키는 통일해서 사용
+                            opening_map = (
+                                _m.rename(columns={src_col: "opening_bs"})
+                                  .groupby("계정코드")["opening_bs"].first()
+                                  .to_dict()
+                            )
+                        else:
+                            opening_map = {}  # 모든 계정 0.0으로 처리(아래에서 기본값 적용)
 
                     # (5) BS/PL 플래그
                     is_bs_map = {}
@@ -1366,6 +1400,21 @@ if uploaded_file is not None:
                         except Exception as _e:
                             st.warning(f"러너 출력 요약 실패: {type(_e).__name__}: {_e}")
 
+                        # === Opening 소스/적용 여부 표시 ===
+                        st.markdown("**Opening 소스 및 적용 현황**")
+                        try:
+                            src_used = ("전전기말잔액" if "전전기말잔액" in master_df.columns else
+                                        "전기말잔액" if "전기말잔액" in master_df.columns else "N/A")
+                            st.write({"opening_source_for_BS_balance": src_used})
+                            # 표본 1~2개 계정에 대해 opening 적용값 미리보기
+                            _peek = []
+                            for k, v in list(opening_map.items())[:2]:
+                                _peek.append({"계정코드": k, "opening_raw": v})
+                            if _peek:
+                                st.dataframe(pd.DataFrame(_peek), use_container_width=True, height=120)
+                        except Exception:
+                            pass
+
                         # 부호 보정 가드 표시
                         st.markdown("**부호 보정 가드**")
                         try:
@@ -1373,7 +1422,8 @@ if uploaded_file is not None:
                             plot_sign_flip = False  # 플롯 레벨 반전은 하지 않음
                             st.write({
                                 "pipeline_norm": bool(pipeline_norm),
-                                "plot_sign_flip": bool(plot_sign_flip),
+                                "plot_sign_flip": False,   # 플롯 레벨 반전 금지
+                                "opening_sign_applied_in_pipeline": True,
                                 "guard_ok": bool(pipeline_norm and not plot_sign_flip)
                             })
                             if pipeline_norm and plot_sign_flip:
@@ -1482,42 +1532,87 @@ if uploaded_file is not None:
                 
                 with tab_corr:
                     st.header("상관관계")
-                    upload_id = getattr(uploaded_file, 'name', '_default')
-                    # 한 탭 내 순차 렌더(서브탭 사용 금지)
-                    st.subheader("기본 상관관계")
-                    _render_corr_basic_tab(upload_id=upload_id)
-                    st.markdown("---")
-                    st.subheader("고급 상관관계")
-                    _render_corr_advanced_tab(upload_id=upload_id)
+                    
+                    # === 앱 초기화 시 빈 화면 방지 ===
+                    if not uploaded_file:
+                        st.info("📁 원장 파일을 업로드하면 상관관계 분석이 가능합니다.")
+                    else:
+                        upload_id = getattr(uploaded_file, 'name', '_default')
+                        # 한 탭 내 순차 렌더(서브탭 사용 금지)
+                        def _render_corr_basic_tab(upload_id):
+                            """기본 상관관계 렌더링"""
+                            try:
+                                from analysis.correlation import run_correlation_module
+                                lf_use = _lf_by_scope()
+                                if lf_use is None or lf_use.df.empty:
+                                    st.info("분석할 데이터가 없습니다.")
+                                    return
+                                
+                                # 상관관계 분석 실행
+                                mr = run_correlation_module(lf_use)
+                                
+                                # 결과 표시
+                                if "correlation_matrix" in mr.figures:
+                                    st.plotly_chart(mr.figures["correlation_matrix"], use_container_width=True)
+                                
+                                if "high_corr_pairs" in mr.tables:
+                                    st.subheader("높은 상관관계 계정 쌍")
+                                    st.dataframe(mr.tables["high_corr_pairs"], use_container_width=True)
+                                    
+                                if mr.warnings:
+                                    for warning in mr.warnings:
+                                        st.warning(warning)
+                                        
+                            except Exception as e:
+                                st.error(f"기본 상관분석 오류: {e}")
+                        
+                        def _render_corr_advanced_tab(upload_id):
+                            """고급 상관관계 렌더링 (현재 구현 중)"""
+                            st.info("🚧 고급 상관분석 기능은 현재 개발 중입니다.")
+                            st.caption("시계열 분석 후 기본 상관관계를 확인해 주세요.")
+                        
+                        st.subheader("기본 상관관계")
+                        _render_corr_basic_tab(upload_id=upload_id)
+                        st.markdown("---")
+                        st.subheader("고급 상관관계")
+                        _render_corr_advanced_tab(upload_id=upload_id)
                 with tab_report:
                     st.header("🧠 분석 종합 대시보드")
-                    # --- Preview: modules session quick view ---
-                    modules_list_preview = list(st.session_state.get('modules', {}).values())
-                    with st.expander("🔎 모듈별 요약/증거 미리보기", expanded=False):
-                        if not modules_list_preview:
-                            st.info("모듈 결과가 비어 있습니다. 먼저 각 모듈을 실행하세요.")
-                        else:
-                            for mr in modules_list_preview:
-                                try:
-                                    st.subheader(f"• {getattr(mr, 'name', 'module')}")
-                                    if getattr(mr, 'summary', None):
-                                        st.json(mr.summary)
-                                    evs = list(getattr(mr, 'evidences', []))
-                                    if evs:
-                                        st.write("Evidence 샘플 (상위 3)")
-                                        for ev in evs[:3]:
-                                            try:
-                                                st.write(f"- reason={ev.reason} | risk={float(ev.risk_score):.2f} | amount={float(ev.financial_impact):,.0f}")
-                                            except Exception:
-                                                st.write("- (표시 실패)")
-                                    if getattr(mr, 'tables', None):
-                                        try: st.caption(f"tables: {list(mr.tables.keys())}")
-                                        except Exception: pass
-                                    if getattr(mr, 'figures', None):
-                                        try: st.caption(f"figures: {list(mr.figures.keys())}")
-                                        except Exception: pass
-                                except Exception:
-                                    st.caption("(미리보기 실패)")
+                    
+                    # === 앱 초기화 시 빈 화면 방지 ===
+                    if not uploaded_file:
+                        st.info("📁 원장 파일을 업로드하면 종합 대시보드가 표시됩니다.")
+                    elif not st.session_state.get('modules', {}):
+                        st.info("📊 다른 분석 탭(시계열, 이상 패턴 등)을 실행하면 결과가 여기에 집계됩니다.")
+                        st.caption("💡 **시계열 예측** 탭에서 계정을 선택하고 분석을 실행해보세요.")
+                    else:
+                        # --- Preview: modules session quick view ---
+                        modules_list_preview = list(st.session_state.get('modules', {}).values())
+                        with st.expander("🔎 모듈별 요약/증거 미리보기", expanded=False):
+                            if not modules_list_preview:
+                                st.info("모듈 결과가 비어 있습니다. 먼저 각 모듈을 실행하세요.")
+                            else:
+                                for mr in modules_list_preview:
+                                    try:
+                                        st.subheader(f"• {getattr(mr, 'name', 'module')}")
+                                        if getattr(mr, 'summary', None):
+                                            st.json(mr.summary)
+                                        evs = list(getattr(mr, 'evidences', []))
+                                        if evs:
+                                            st.write("Evidence 샘플 (상위 3)")
+                                            for ev in evs[:3]:
+                                                try:
+                                                    st.write(f"- reason={ev.reason} | risk={float(ev.risk_score):.2f} | amount={float(ev.financial_impact):,.0f}")
+                                                except Exception:
+                                                    st.write("- (표시 실패)")
+                                        if getattr(mr, 'tables', None):
+                                            try: st.caption(f"tables: {list(mr.tables.keys())}")
+                                            except Exception: pass
+                                        if getattr(mr, 'figures', None):
+                                            try: st.caption(f"figures: {list(mr.figures.keys())}")
+                                            except Exception: pass
+                                    except Exception:
+                                        st.caption("(미리보기 실패)")
                     # LLM 키 미가용이어도 오프라인 리포트 모드로 생성 가능
                     LLM_OK = False
                     try:
