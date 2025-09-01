@@ -23,7 +23,12 @@ from analysis.timeseries import (
     run_timeseries_module,          # ← 보고서 탭에서 계속 사용
     create_timeseries_figure        # ← 그래프 렌더 그대로 사용
 )
-from analysis.ts_v2 import run_timeseries_minimal  # ← 새 최소 러너(EMA)
+from analysis.ts_v2 import (
+    run_timeseries_minimal,
+    compute_series_stats,     # ← NEW
+    build_anomaly_table,      # ← NEW
+    add_future_shading        # ← NEW (시각 음영)
+)
 from analysis.aggregation import aggregate_monthly, month_end_00
 from analysis.anomaly import run_anomaly_module, compute_amount_columns
 from analysis.correlation import run_correlation_module
@@ -234,17 +239,18 @@ def _apply_scope(df: pd.DataFrame, scope: str) -> pd.DataFrame:
     return df
 
 # === 공용: 표 높이 자동 제한(행 수 기반) ===
-def _auto_table_height(df, max_rows: int = 10, row_px: int = 36, header_px: int = 42) -> int:
+def _auto_table_height(df: pd.DataFrame, max_rows: int = 8,
+                       row_px: int = 28, header_px: int = 38, pad_px: int = 12) -> int:
     """
-    df 길이에 맞춰 높이를 계산. 최대 max_rows까지만 보이고, 넘치면 스크롤.
-    - row_px는 테마에 따라 34~40px 정도가 자연스러움.
+    표 높이를 '표시 행 수' 기준으로 계산해 넘기기 위한 유틸.
+    - max_rows: 최대 표시 행수
+    - 실패 시 300px로 폴백
     """
     try:
-        n = int(len(df))
+        n = int(min(max(len(df), 1), max_rows))
+        return int(header_px + n * row_px + pad_px)
     except Exception:
-        n = max_rows
-    visible = min(max(n, 1), max_rows)  # 최소 1행은 보이게
-    return int(visible * row_px + header_px)
+        return 300
 
 def _lf_by_scope() -> LedgerFrame:
     """상관/거래처/이상치에서 사용할 스코프 적용 LedgerFrame."""
@@ -826,6 +832,12 @@ if uploaded_file is not None:
                             help="선택한 계정에 대해서만 예측 테이블/그래프를 생성합니다."
                         )
 
+                    # 미래 예측 개월 수 슬라이더 추가
+                    forecast_horizon = st.slider(
+                        "미래 예측 개월 수(시각화용)", min_value=0, max_value=12, value=0, step=1,
+                        help="표본 N<6이면 자동으로 0으로 비활성화됩니다."
+                    )
+
                     if not picked_names:
                         st.info("시계열 결과가 없습니다. (선택한 계정/기간에 데이터 없음)")
                         st.stop()
@@ -940,14 +952,26 @@ if uploaded_file is not None:
                         if not out.empty:
                             tmp = out.copy()
                             tmp.insert(0, "계정", acc_name)
+
                             # 그래프/진단용(전 구간)
                             results_per_account[acc_name] = tmp
-                            # 요약표(마지막 1행만)
-                            last_flow = tmp[tmp["measure"].eq("flow")].tail(1)
-                            if not last_flow.empty: gathered_flow.append(last_flow)
-                            if is_bs:
-                                last_bal = tmp[tmp["measure"].eq("balance")].tail(1)
-                                if not last_bal.empty: gathered_balance.append(last_bal)
+
+                            # === 요약행(마지막 1행) + 통계열 추가 ===
+                            for ms in ("flow", "balance"):
+                                dfm = tmp[tmp["measure"].eq(ms)]
+                                if dfm.empty:
+                                    continue
+                                stats = compute_series_stats(dfm)
+                                last_row = dfm.tail(1).copy()
+                                last_row["MAE"]  = stats["MAE"]
+                                last_row["MAPE"] = stats["MAPE"]
+                                last_row["RMSE"] = stats["RMSE"]
+                                last_row["N"]    = stats["N"]
+
+                                if ms == "flow":
+                                    gathered_flow.append(last_row)
+                                else:
+                                    gathered_balance.append(last_row)
 
                     # === 공용: 표 높이 자동 계산 ===
                     def _auto_table_height(df: pd.DataFrame, *, min_rows=3, max_rows=10, row_px=32, header_px=40, padding_px=16) -> int:
@@ -960,48 +984,189 @@ if uploaded_file is not None:
                         if not blocks:
                             return
                         tbl = pd.concat(blocks, ignore_index=True)
-                        show_cols = ["계정","date","actual","predicted","error","z","risk","model"]
-                        present = [c for c in show_cols if c in tbl.columns]
+
+                        show_cols = ["계정","date","actual","predicted","error","z","risk","model",
+                                     "MAE","MAPE","RMSE","N"]  # ← 통계 열 추가
                         for c in show_cols:
                             if c not in tbl.columns:
                                 tbl[c] = np.nan
-                        # 안전 가드: 수치형 변환(누락 컬럼은 위에서 NaN 보강)
-                        try:
-                            num_cols = [c for c in ["actual","predicted","error","z","risk"] if c in tbl.columns]
-                            if num_cols:
-                                tbl[num_cols] = tbl[num_cols].apply(pd.to_numeric, errors='coerce')
-                        except Exception:
-                            pass
-                        # 사용자 친화 표기: measure 라벨 매핑(있는 경우)
-                        if 'measure' in tbl.columns:
-                            try:
-                                tbl['measure'] = tbl['measure'].map(lambda m: '발생액(Flow)' if str(m) == 'flow' else ('잔액(Balance)' if str(m) == 'balance' else str(m)))
-                            except Exception:
-                                pass
-                        tbl = tbl[show_cols].rename(columns={
-                            "date":"일자","actual":"실측","predicted":"예측",
-                            "error":"잔차","risk":"위험도","model":"모델(MoR)"
-                        })
-                        # 정렬·스타일 안전화: 일자 캐스팅 후 정렬
-                        if "일자" in tbl.columns:
-                            try:
-                                tbl["일자"] = pd.to_datetime(tbl["일자"], errors="coerce")
-                                tbl = tbl.sort_values(["계정","일자"])
-                            except Exception:
-                                tbl = tbl.sort_values(["계정"])  # 폴백
+
+                        # 사용자 친화 라벨/정렬
+                        tbl = (tbl.rename(columns={
+                                "date":"일자","actual":"실측","predicted":"예측",
+                                "error":"잔차","risk":"위험도","model":"모델(MoR)"
+                            })
+                            .sort_values(["계정","일자"])
+                        )
+
                         st.subheader(title)
                         fmt = {}
-                        for c in ["실측","예측","잔차"]:
+                        for c in ["실측","예측","잔차","MAE","RMSE"]:
                             if c in tbl.columns: fmt[c] = "{:,.0f}"
-                        if "위험도" in tbl.columns: fmt["위험도"] = "{:.2f}"
+                        if "MAPE" in tbl.columns: fmt["MAPE"] = "{:.2f}%"
                         if "z" in tbl.columns: fmt["z"] = "{:.2f}"
-                        h = _auto_table_height(tbl)  # ✨ 행수 기반 자동 높이
-                        st.dataframe(tbl.style.format(fmt), use_container_width=True, height=h)
+                        if "위험도" in tbl.columns: fmt["위험도"] = "{:.2f}"
+
+                        # 표 높이: 행수 기반으로 자동(최대 420px)
+                        rows = max(1, len(tbl))
+                        height = min(420, 42 + rows * 28)
+
+                        st.dataframe(tbl[["계정","일자","실측","예측","잔차","z","위험도","모델(MoR)","MAE","MAPE","RMSE","N"]]
+                                     .style.format(fmt),
+                                     use_container_width=True, height=height)
+
                         st.download_button(
                             "CSV 다운로드", data=tbl.to_csv(index=False).encode("utf-8-sig"),
                             file_name=f"timeseries_summary_{'flow' if 'Flow' in title else 'balance'}.csv",
                             mime="text/csv"
                         )
+
+                    def _render_table_combined(flow_blocks, balance_blocks, title="선택계정 요약 (Flow+Balance)"):
+                        import pandas as pd
+                        import numpy as np
+                        blocks = []
+
+                        def _prep(df, label):
+                            if df is None or len(df) == 0:
+                                return None
+                            x = pd.concat(df, ignore_index=True)
+                            
+                            # 먼저 rename을 해서 컬럼명을 통일
+                            rename_map = {
+                                "account": "계정", "date": "일자",
+                                "actual": "실측", "predicted": "예측",
+                                "error": "잔차", "risk": "위험도",
+                                "model": "모델(MoR)"
+                            }
+                            for k, v in rename_map.items():
+                                if k in x.columns and v not in x.columns:  # 중복 방지
+                                    x.rename(columns={k: v}, inplace=True)
+                            
+                            # 그 다음 '기준' 컬럼 추가
+                            x.insert(0, "기준", label)
+                            return x
+
+                        f = _prep(flow_blocks, "발생액(Flow)")
+                        b = _prep(balance_blocks, "잔액(Balance)")
+                        if f is not None: blocks.append(f)
+                        if b is not None: blocks.append(b)
+                        if not blocks:
+                            return
+
+                        tbl = pd.concat(blocks, ignore_index=True)
+
+                        # 중복 컬럼 제거 (혹시 있다면)
+                        tbl = tbl.loc[:, ~tbl.columns.duplicated()]
+
+                        want_cols = ["기준", "계정", "일자", "실측", "예측", "잔차", "z", "위험도", "모델(MoR)"]
+                        show_cols = [c for c in want_cols if c in tbl.columns]
+                        tbl = tbl[show_cols].copy()
+
+                        # 포맷
+                        fmt = {}
+                        for c in ["실측", "예측", "잔차"]:
+                            if c in tbl.columns: fmt[c] = "{:,.0f}"
+                        if "z" in tbl.columns: fmt["z"] = "{:.2f}"
+                        if "위험도" in tbl.columns: fmt["위험도"] = "{:.2f}"
+
+                        st.subheader(title)
+
+                        # 인덱스 숨김 (버전 호환: 실패 시 reset_index로 대체)
+                        tbl = tbl.reset_index(drop=True)  # 인덱스 확실히 제거
+                        try:
+                            st.dataframe(
+                                tbl.style.format(fmt),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(360, 44 + 32 * max(1, len(tbl)))
+                            )
+                        except TypeError:
+                            st.dataframe(
+                                tbl.style.format(fmt),
+                                use_container_width=True,
+                                height=min(360, 44 + 32 * max(1, len(tbl)))
+                            )
+
+                        # CSV
+                        st.download_button(
+                            "CSV 다운로드",
+                            data=tbl.to_csv(index=False).encode("utf-8-sig"),
+                            file_name="timeseries_summary_all.csv",
+                            mime="text/csv"
+                        )
+
+                    def _render_outlier_alert(results_per_account: dict, *, topn: int = 10, z_thr: float = 2.0):
+                        """
+                        results_per_account: {계정명 -> DataFrame}, DataFrame은 최소 컬럼
+                          ['date','actual','predicted','error','z','risk','model','measure'] 가정
+                          measure ∈ {'flow','balance'}
+                        """
+                        import pandas as pd
+                        import numpy as np
+                        rows = []
+                        for acc_name, df in (results_per_account or {}).items():
+                            if df is None or df.empty or "z" not in df.columns:
+                                continue
+                            dfx = df.copy()
+                            # 계정명 보강 (혹시 누락 대비)
+                            if "계정" not in dfx.columns:
+                                dfx["계정"] = acc_name
+                            # 기준 라벨(발생액/잔액)
+                            dfx["기준"] = dfx.get("measure", "").map(
+                                {"flow": "발생액(Flow)", "balance": "잔액(Balance)"}
+                            ).fillna("발생액(Flow)")
+                            # |z| 필터
+                            dfx = dfx[dfx["z"].abs() >= float(z_thr)]
+                            if not dfx.empty:
+                                rows.append(dfx)
+
+                        # 헤더 + 테이블
+                        import streamlit as st
+                        st.subheader(f"이상월 알림 (상위 {topn}건, 기준 |z| ≥ {z_thr:.1f})")
+
+                        if not rows:
+                            st.info(f"이상월 없음(기준 |z| ≥ {z_thr:.1f})")
+                            return
+
+                        out = pd.concat(rows, ignore_index=True)
+
+                        # 정렬: |z| 내림차순 → |잔차| 보조
+                        out = out.sort_values(
+                            by=["z", "error"],
+                            key=lambda s: s.abs() if s.name in ("z", "error") else s,
+                            ascending=[False, False]
+                        ).head(int(topn))
+
+                        # 표시 컬럼/한글명
+                        rename = {"date": "일자", "actual": "실측", "predicted": "예측",
+                                  "error": "잔차", "risk": "위험도", "model": "모델"}
+                        for k, v in rename.items():
+                            if k in out.columns:
+                                out.rename(columns={k: v}, inplace=True)
+
+                        show_cols = [c for c in ["계정", "일자", "실측", "예측", "잔차", "z", "위험도", "모델", "기준"] if c in out.columns]
+                        out = out[show_cols]
+
+                        fmt = {}
+                        for c in ["실측", "예측", "잔차"]:
+                            if c in out.columns: fmt[c] = "{:,.0f}"
+                        if "z" in out.columns: fmt["z"] = "{:.2f}"
+                        if "위험도" in out.columns: fmt["위험도"] = "{:.2f}"
+
+                        try:
+                            st.dataframe(
+                                out.style.format(fmt),
+                                use_container_width=True,
+                                hide_index=True,
+                                height=min(44 + 32 * max(1, len(out)), 360)
+                            )
+                        except TypeError:
+                            # Streamlit 구버전 호환
+                            st.dataframe(
+                                out.reset_index(drop=True).style.format(fmt),
+                                use_container_width=True,
+                                height=min(44 + 32 * max(1, len(out)), 360)
+                            )
 
                     # === NEW: 선택계정 통계 및 이상월 리스트 렌더링 함수 정의 ===
                     def _safe_div(a, b):
@@ -1011,113 +1176,13 @@ if uploaded_file is not None:
                         except Exception:
                             return np.nan
 
-                    def _render_series_stats(results_per_account: dict, pm_value: float):
-                        try:
-                            stats_rows = []
-                            for acc_name, df_all in results_per_account.items():
-                                dfx = df_all[df_all.get("measure","flow").eq("flow")] if "measure" in df_all.columns else df_all
-                                if dfx.empty: 
-                                    continue
-                                # 필수 컬럼 보정
-                                for c in ["actual","predicted","error","z"]:
-                                    if c not in dfx.columns:
-                                        dfx[c] = np.nan
-                                # 수치 변환
-                                for c in ["actual","predicted","error","z"]:
-                                    dfx[c] = pd.to_numeric(dfx[c], errors="coerce")
-                                n = int(len(dfx))
-                                if n == 0:
-                                    continue
-                                mae = float(np.nanmean(np.abs(dfx["error"])))
-                                mape = float(np.nanmean(np.abs(_safe_div(dfx["error"], dfx["actual"])))) * 100.0
-                                smape = float(np.nanmean(2.0 * np.abs(dfx["error"]) / np.clip(np.abs(dfx["actual"]) + np.abs(dfx["predicted"]), 1e-9, None))) * 100.0
-                                max_abs_z = float(np.nanmax(np.abs(dfx["z"]))) if dfx["z"].notna().any() else np.nan
-                                kit_cnt = int((np.abs(dfx["error"]) >= float(pm_value)).sum())
-                                model_lbl = None
-                                if "model" in dfx.columns:
-                                    try:
-                                        model_lbl = dfx["model"].dropna().astype(str).iloc[-1]
-                                    except Exception:
-                                        model_lbl = None
-                                stats_rows.append({
-                                    "계정": acc_name,
-                                    "표본월": n,
-                                    "MAE": mae,
-                                    "MAPE(%)": mape,
-                                    "SMAPE(%)": smape,
-                                    "최대|z|": max_abs_z,
-                                    "KIT(건)": kit_cnt,
-                                    "모델": model_lbl or "-"
-                                })
-                            if not stats_rows:
-                                return
-                            statdf = pd.DataFrame(stats_rows).sort_values("MAE")
-                            fmt = {"MAE":"{:,.0f}","MAPE(%)":"{:.2f}","SMAPE(%)":"{:.2f}","최대|z|":"{:.2f}"}
-                            st.subheader("선택계정 통계 — 발생액(Flow)")
-                            h = _auto_table_height(statdf)  # ✨ 행수 기반 자동 높이
-                            st.dataframe(statdf.style.format(fmt), use_container_width=True, height=h)
-                            st.download_button(
-                                "통계 CSV 다운로드",
-                                data=statdf.to_csv(index=False).encode("utf-8-sig"),
-                                file_name="timeseries_stats_flow.csv",
-                                mime="text/csv"
-                            )
-                        except Exception as _e:
-                            st.warning(f"통계 테이블 생성 실패: {_e}")
+                    _render_table_combined(gathered_flow, gathered_balance, title="선택계정 요약 (Flow+Balance)")
 
-                    def _render_anomaly_list(results_per_account: dict, *, z_cut: float = 2.0, topn: int = 30):
-                        try:
-                            rows = []
-                            for acc_name, df_all in results_per_account.items():
-                                if "z" not in df_all.columns: 
-                                    continue
-                                # Flow 우선, 없으면 전체
-                                subset = df_all[df_all.get("measure","flow").eq("flow")] if "measure" in df_all.columns else df_all
-                                if subset.empty:
-                                    continue
-                                # 계정별 최신 모델 라벨(가능하면)
-                                model_lbl = None
-                                if "model" in subset.columns:
-                                    try:
-                                        model_lbl = subset["model"].dropna().astype(str).iloc[-1]
-                                    except Exception:
-                                        model_lbl = None
-                                # 알림 조건
-                                bad = subset[subset["z"].abs() >= float(z_cut)].copy()
-                                if bad.empty: 
-                                    continue
-                                # 표시 컬럼 표준화
-                                keep = ["date","actual","predicted","error","z","risk"]
-                                for c in keep:
-                                    if c not in bad.columns:
-                                        bad[c] = np.nan
-                                bad = bad[keep].copy()
-                                bad.insert(0, "계정", acc_name)
-                                if model_lbl is not None:
-                                    bad["모델"] = model_lbl
-                                rows.append(bad)
-                            if not rows:
-                                st.info(f"|z| ≥ {z_cut:.1f}에 해당하는 이상월이 없습니다.")
-                                return
-                            out = pd.concat(rows, ignore_index=True)
-                            out = out.sort_values("z", key=lambda s: s.abs(), ascending=False).head(int(topn))
-                            out = out.rename(columns={
-                                "date":"일자","actual":"실측","predicted":"예측","error":"잔차","z":"z","risk":"위험도"
-                            })
-                            fmt = {"실측":"{:,.0f}","예측":"{:,.0f}","잔차":"{:,.0f}","위험도":"{:.2f}","z":"{:.2f}"}
-                            st.subheader(f"이상월 알림 (상위 {min(topn, len(out))}건, 기준 |z| ≥ {z_cut:.1f})")
-                            h = _auto_table_height(out)  # ✨ 행수 기반 자동 높이
-                            st.dataframe(out.style.format(fmt), use_container_width=True, height=h)
-                        except Exception as _e:
-                            st.warning(f"이상월 리스트 생성 실패: {_e}")
-
-                    _render_table(gathered_flow, "선택계정 요약 — 발생액(Flow)")
-                    _render_table(gathered_balance, "선택계정 요약 — 잔액(Balance)")
-                    _render_series_stats(results_per_account, pm_value=float(st.session_state.get("pm_value", PM_DEFAULT)))
-                    _render_anomaly_list(results_per_account, z_cut=2.0, topn=30)
+                    # 통합 이상월 알림 (|z| ≥ 2.0 고정)
+                    _render_outlier_alert(results_per_account, topn=10, z_thr=2.0)
 
                     # ============ 🔎 시계열 파이프라인 진단(현황판) ============ #
-                    with st.expander("🔎 시계열 파이프라인 진단(현황판)", expanded=True):
+                    with st.expander("🔎 시계열 파이프라인 진단(현황판)", expanded=False):
                         st.caption("각 단계별로 포인트 수/타입/정규화 상태를 집계합니다. 그래프가 안 뜨면 어디서 끊겼는지 여기서 확인하세요.")
                         # 0) 원본 슬라이스 요약
                         st.markdown("**0) 입력(원장 슬라이스) 요약**")
@@ -1133,7 +1198,11 @@ if uploaded_file is not None:
                                 "NaN(금액)": int(pd.to_numeric(ldf[amount_col], errors="coerce").isna().sum()),
                                 "기간": f"{pd.to_datetime(ldf[date_col], errors='coerce').min()} ~ {pd.to_datetime(ldf[date_col], errors='coerce').max()}",
                             })
-                            st.dataframe(ldf[[date_col, "계정코드", "계정명", amount_col]].head(5), use_container_width=True)
+                            st.dataframe(
+                                ldf[[date_col, "계정코드", "계정명", amount_col]].head(5),
+                                use_container_width=True,
+                                height=_auto_table_height(ldf.head(5))
+                            )
                         except Exception as _e:
                             st.warning(f"입력 요약 실패: {_e}")
 
@@ -1150,7 +1219,11 @@ if uploaded_file is not None:
                                 "월말 00:00:00 비율": f"{_norm_ok}/{len(_grp)}",
                                 "예: 첫 3행": None
                             })
-                            st.dataframe(_grp.head(3), use_container_width=True)
+                            st.dataframe(
+                                _grp.head(3),
+                                use_container_width=True,
+                                height=_auto_table_height(_grp.head(3))
+                            )
                             # (보너스) 경계선 예상 개수
                             try:
                                 rng = pd.date_range(pd.to_datetime(ldf[date_col]).min(), pd.to_datetime(ldf[date_col]).max(), freq="M")
@@ -1183,7 +1256,11 @@ if uploaded_file is not None:
                                         "flow 포인트": int(_all[_all.get("measure","flow").eq("flow")].shape[0]) if "measure" in _all.columns else int(_all.shape[0]),
                                         "balance 포인트": int(_all[_all.get("measure","flow").eq("balance")].shape[0]) if "measure" in _all.columns else 0,
                                     })
-                                    st.dataframe(_all.head(5), use_container_width=True)
+                                    st.dataframe(
+                                        _all.head(5),
+                                        use_container_width=True,
+                                        height=_auto_table_height(_all.head(5))
+                                    )
                         except Exception as _e:
                             st.warning(f"러너 출력 요약 실패: {type(_e).__name__}: {_e}")
 
@@ -1209,34 +1286,93 @@ if uploaded_file is not None:
                                 for ms in (["flow","balance"] if df_all["measure"].eq("balance").any() else ["flow"]):
                                     dfx = df_all[df_all["measure"].eq(ms)]
                                     st.write(f"- {acc_name} / {ms}: N={len(dfx)} · 컬럼={list(dfx.columns)} · 날짜범위={pd.to_datetime(dfx['date']).min()}~{pd.to_datetime(dfx['date']).max()}")
-                                    st.dataframe(dfx[["date","actual","predicted"]].head(3), use_container_width=True)
+                                    st.dataframe(
+                                        dfx[["date","actual","predicted"]].head(3),
+                                        use_container_width=True,
+                                        height=_auto_table_height(dfx.head(3))
+                                    )
                         except Exception as _e:
                             st.warning(f"그림 입력 점검 실패: {_e}")
 
-                    # === 옵션: 경계선 표시 토글 ===
-                    show_dividers = st.checkbox("연/분기 경계선 표시", value=True, key="ts_show_dividers")
+                    # === 연/분기 경계선 기본 표시 ===
+                    show_dividers = True
+
+                    # === 계정×기준 통계 요약 ===
+                    def _safe_stats_block(df_in: pd.DataFrame) -> dict:
+                        s = {}
+                        try:
+                            a = pd.to_numeric(df_in.get("actual"), errors="coerce")
+                            p = pd.to_numeric(df_in.get("predicted"), errors="coerce")
+                            e = a - p
+                            s["N"] = int(len(df_in))
+                            s["MAE"] = float(np.nanmean(np.abs(e)))
+                            denom = a.replace(0, np.nan)
+                            s["MAPE(%)"] = float(np.nanmean(np.abs(e / denom)) * 100.0)
+                            s["RMSE"] = float(np.sqrt(np.nanmean((e**2))))
+                            z = pd.to_numeric(df_in.get("z"), errors="coerce")
+                            s["|z|_max"] = float(np.nanmax(np.abs(z))) if z is not None else np.nan
+                            s["last_z"] = float(z.iloc[-1]) if (z is not None and len(z) > 0) else np.nan
+                            s["last_err"] = float(e.iloc[-1]) if len(e) > 0 else np.nan
+                            s["model"] = str(df_in.get("model").iloc[-1]) if "model" in df_in.columns and len(df_in) > 0 else ""
+                        except Exception:
+                            pass
+                        return s
+
+                    stats_rows = []
+                    for acc_name, df_all in results_per_account.items():
+                        for ms in (["flow","balance"] if df_all["measure"].eq("balance").any() else ["flow"]):
+                            d = df_all[df_all["measure"].eq(ms)]
+                            if d.empty:
+                                continue
+                            row = {"계정": acc_name, "기준": ("발생액(Flow)" if ms=="flow" else "잔액(Balance)")}
+                            row.update(_safe_stats_block(d))
+                            stats_rows.append(row)
+
+                    if stats_rows:
+                        stats_df = pd.DataFrame(stats_rows)[
+                            ["계정","기준","N","MAE","MAPE(%)","RMSE","|z|_max","last_z","last_err","model"]
+                        ]
+                        fmt = {"MAE":"{:,.0f}","MAPE(%)":"{:.2f}","RMSE":"{:,.0f}","|z|_max":"{:.2f}","last_z":"{:.2f}","last_err":"{:,.0f}"}
+                        st.subheader("계정별 통계 요약")
+                        st.dataframe(
+                            stats_df.style.format(fmt),
+                            use_container_width=True,
+                            height=_auto_table_height(stats_df)
+                        )
 
                     # === 그래프 렌더(아래): 계정별로 표시 ===
                     for acc_name, df_all in results_per_account.items():
                         for measure in (["flow","balance"] if (df_all["measure"].eq("balance").any()) else ["flow"]):
-                            dfm = df_all[df_all["measure"]==measure].rename(columns={"account":"계정"}).copy()
-                            dfm["date"] = pd.to_datetime(dfm["date"], errors="coerce")
-                            dfm = dfm.sort_values("date").reset_index(drop=True)
+                            dfm = df_all[df_all["measure"]==measure].rename(columns={"account":"계정"})
                             title = f"{acc_name} — {'발생액(Flow)' if measure=='flow' else '잔액(Balance)'}"
-                            fig, stats = create_timeseries_figure(
+
+                            # 표본수 게이트: N<6이면 미래 음영 비활성화
+                            stats = compute_series_stats(dfm)
+                            _hz = int(forecast_horizon or 0)
+                            if stats["N"] < 6:
+                                _hz = 0
+
+                            fig, stats_d = create_timeseries_figure(
                                 dfm, measure=measure, title=title,
-                                pm_value=PM,
-                                show_dividers=bool(show_dividers)
+                                pm_value=PM, show_dividers=True   # ← 분기/연 경계선 켜기
                             )
+
+                            # 미래 구간 음영(시각화 전용)
+                            if _hz > 0 and not dfm.empty:
+                                last_date = pd.to_datetime(dfm["date"]).max()
+                                fig = add_future_shading(fig, last_date, horizon_months=_hz)
+
                             st.subheader(title)
                             if fig is not None:
                                 st.plotly_chart(fig, use_container_width=True)
-                            if stats:
+
+                            if stats_d:
                                 st.caption(
                                     f"모형:{dfm.get('model','').iloc[-1] if not dfm.empty else '-'} · "
-                                    f"정상성:{stats.get('diagnostics',{}).get('stationary')} · "
-                                    f"계절성:{stats.get('diagnostics',{}).get('seasonality')} · "
-                                    f"표본월:{stats.get('diagnostics',{}).get('n_months')}"
+                                    f"정상성:{stats_d.get('diagnostics',{}).get('stationary')} · "
+                                    f"계절성:{stats_d.get('diagnostics',{}).get('seasonality')} · "
+                                    f"표본월:{stats_d.get('diagnostics',{}).get('n_months')}"
+                                    + ("" if _hz == forecast_horizon else " · (표본 부족으로 미래음영 비활성)")
                                 )
                 # ⚠️ 기존 tab5(위험평가) 블록 전체 삭제됨
                 
